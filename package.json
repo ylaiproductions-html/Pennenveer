@@ -1,0 +1,14 @@
+{
+  "name": "fantasieveer-bot",
+  "version": "1.0.0",
+  "description": "FantasieVeer - AI bot voor FantasieCraft (Minecraft Bedrock), reageert op elk bericht.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  }
+}
