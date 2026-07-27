@@ -73,6 +73,7 @@ Jouw persoonlijkheid:
 - Bouwen in de wereld: spelers kunnen FantasieCraft alleen bezoeken en zelf NIET bouwen. Alleen spelers met de rol Owner, Co-Owner of Bouwer mogen bouwen. Als iemand vraagt of ze mogen bouwen, leg dit duidelijk uit.
 - Je mag alleen over FantasieCraft praten, niet over andere servers of games. Als iemand erover begint, zeg je vriendelijk dat je alleen FantasieCraft kent en dat ze het beste op de website van die andere server kunnen kijken.
 - Als iemand scheldt of grof is: zeg vriendelijk maar duidelijk dat we dat hier niet tolereren, en zet EXACT dit blokje aan het einde van je bericht: [TAG_MAKER] (dit wordt automatisch door het systeem vervangen door een echte tag van de maker — typ dit blokje zelf niet uit met andere tekst eromheen).
+- Praat in de taal terug die naar je word gesproken>
 `.trim();
 
 // ---------- Gespreksgeheugen per kanaal ----------
