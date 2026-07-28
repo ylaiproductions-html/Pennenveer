@@ -345,6 +345,16 @@ function warningSummary(userId) {
   return { spamCount, curseCount, total: recentEvents.length, muted, mutedUntil: entry.mutedUntil };
 }
 
+// Wist alle waarschuwingen van een gebruiker en heft een eventuele mute meteen op.
+// Geeft terug of er iets te wissen viel (voor een nette bevestiging).
+function resetWarnings(userId) {
+  const hadSomething = warningsMap.has(userId) && warningSummary(userId).total > 0;
+  const wasMuted = isMuted(userId);
+  warningsMap.set(userId, { events: [], mutedUntil: null });
+  scheduleSave();
+  return { hadSomething, wasMuted };
+}
+
 // ---------- Anti-spam voor de AI-quota: cooldown per gebruiker ----------
 const lastMessageAtMap = new Map(); // userId -> timestamp
 
@@ -511,6 +521,7 @@ function buildHelpMessage() {
 • \`!stats\` — een paar statistieken over mij
 • \`!reset\` — wist mijn geheugen van dit gesprek (alleen moderators)
 • \`!waarschuwingen @gebruiker\` — bekijk waarschuwingen van iemand (alleen moderators)
+• \`!warnreset @gebruiker\` — wist de waarschuwingen van iemand en heft een mute meteen op (alleen moderators)
 • \`!wis [aantal]\` — verwijdert berichten van iedereen (ook van mijzelf) uit dit kanaal (alleen moderators)
 • \`!help\` — toont dit berichtje`;
 }
@@ -637,6 +648,12 @@ const slashCommands = [
     .setDescription("Bekijk waarschuwingen van een gebruiker (alleen moderators).")
     .addUserOption((option) =>
       option.setName("gebruiker").setDescription("De gebruiker om op te zoeken").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("warnreset")
+    .setDescription("Wist de waarschuwingen van een gebruiker en heft een mute op (alleen moderators).")
+    .addUserOption((option) =>
+      option.setName("gebruiker").setDescription("De gebruiker om te resetten").setRequired(true)
     ),
   new SlashCommandBuilder()
     .setName("wis")
@@ -809,6 +826,36 @@ client.on("messageCreate", async (message) => {
       await sendAsVeer(message.channel, buildWarningsMessage(targetUser));
     } catch (err) {
       console.error("❌ Fout bij het versturen van waarschuwingen:", err.message);
+    }
+    return;
+  }
+
+  if (trimmedContent.startsWith("!warnreset")) {
+    if (!isModerator(message.author.id)) {
+      try {
+        await sendAsVeer(message.channel, "✨ Alleen moderators mogen waarschuwingen resetten!");
+      } catch {}
+      return;
+    }
+    const targetUser = message.mentions.users.first();
+    if (!targetUser) {
+      try {
+        await sendAsVeer(message.channel, "✨ Tag even iemand erbij, bijvoorbeeld: `!warnreset @gebruiker`");
+      } catch {}
+      return;
+    }
+    const { hadSomething, wasMuted } = resetWarnings(targetUser.id);
+    try {
+      const extra = wasMuted ? " en zijn/haar mute is meteen opgeheven" : "";
+      await sendAsVeer(
+        message.channel,
+        hadSomething
+          ? `🪶 De waarschuwingen van **${targetUser.username}** zijn gewist${extra}. Frisse start! ✨`
+          : `🪶 **${targetUser.username}** had toch al geen waarschuwingen openstaan.`
+      );
+      console.log(`♻️ Waarschuwingen van ${targetUser.username} (${targetUser.id}) gereset door ${message.author.username}.`);
+    } catch (err) {
+      console.error("❌ Fout bij het versturen van de warnreset-bevestiging:", err.message);
     }
     return;
   }
@@ -1003,6 +1050,24 @@ client.on("interactionCreate", async (interaction) => {
       }
       const targetUser = interaction.options.getUser("gebruiker", true);
       await interaction.reply({ content: buildWarningsMessage(targetUser), ephemeral: true });
+      return;
+    }
+
+    if (commandName === "warnreset") {
+      if (!isModerator(interaction.user.id)) {
+        await interaction.reply({ content: "✨ Alleen moderators mogen waarschuwingen resetten!", ephemeral: true });
+        return;
+      }
+      const targetUser = interaction.options.getUser("gebruiker", true);
+      const { hadSomething, wasMuted } = resetWarnings(targetUser.id);
+      const extra = wasMuted ? " en zijn/haar mute is meteen opgeheven" : "";
+      await interaction.reply({
+        content: hadSomething
+          ? `🪶 De waarschuwingen van **${targetUser.username}** zijn gewist${extra}. Frisse start! ✨`
+          : `🪶 **${targetUser.username}** had toch al geen waarschuwingen openstaan.`,
+        ephemeral: true,
+      });
+      console.log(`♻️ Waarschuwingen van ${targetUser.username} (${targetUser.id}) gereset door ${interaction.user.username} (via slash-command).`);
       return;
     }
 
