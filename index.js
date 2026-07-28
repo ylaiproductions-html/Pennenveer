@@ -6,7 +6,8 @@ import path from "path";
 // ============================================================
 //  FantasieVeer — de magische veer van FantasieCraft
 //  Verbeterde versie: slimmer geheugen, stabielere AI-calls,
-//  anti-spam, persistente geschiedenis en betere foutafhandeling.
+//  anti-spam, meerdere moderators om te taggen, persistente
+//  geschiedenis en betere foutafhandeling.
 // ============================================================
 
 // ---------- Config ----------
@@ -19,7 +20,7 @@ const {
   GROQ_MODEL,
   GROQ_FALLBACK_MODEL,
   HISTORY_LENGTH,
-  MODERATOR_USER_ID,
+  MODERATOR_USER_ID, // mag ook meerdere ID's zijn, komma-gescheiden
   USER_COOLDOWN_MS,
   MAX_USER_MESSAGE_LENGTH,
   HISTORY_FILE,
@@ -65,17 +66,33 @@ const TARGET_CHANNEL_IDS = (TARGET_CHANNEL_ID || "")
   .map((id) => id.trim())
   .filter(Boolean);
 
-// MODERATOR_USER_ID opschonen: alleen cijfers overhouden (voor als iemand per ongeluk
-// "<@123...>" of "@gebruikersnaam" in .env plakt in plaats van het kale getal).
-// Een geldig Discord user-ID (snowflake) is 17-20 cijfers lang.
-const rawModeratorId = (MODERATOR_USER_ID || "").replace(/\D/g, "");
-const CLEAN_MODERATOR_ID =
-  rawModeratorId.length >= 17 && rawModeratorId.length <= 20 ? rawModeratorId : null;
+// ---------- Moderators die getagd worden bij spam/schelden ----------
+// MODERATOR_USER_ID mag één ID zijn, of meerdere komma-gescheiden ID's.
+// Deze ID staat er hardcoded ook altijd bij, naast wat er eventueel in .env staat.
+const HARDCODED_MODERATOR_IDS = ["1164557067743400048"];
 
-if (MODERATOR_USER_ID && !CLEAN_MODERATOR_ID) {
-  console.warn(
-    `⚠️ MODERATOR_USER_ID ("${MODERATOR_USER_ID}") lijkt geen geldig Discord user-ID te zijn (moet 17-20 cijfers zijn, zonder <@ of @). De tag-functie wordt overgeslagen tot dit klopt.`
-  );
+function extractValidIds(raw) {
+  return (raw || "")
+    .split(",")
+    .map((part) => part.replace(/\D/g, ""))
+    .filter((id) => id.length >= 17 && id.length <= 20);
+}
+
+const envModeratorIds = extractValidIds(MODERATOR_USER_ID);
+if (MODERATOR_USER_ID) {
+  const rawParts = MODERATOR_USER_ID.split(",").map((p) => p.trim()).filter(Boolean);
+  if (envModeratorIds.length < rawParts.length) {
+    console.warn(
+      `⚠️ Eén of meer waarden in MODERATOR_USER_ID ("${MODERATOR_USER_ID}") lijken geen geldig Discord user-ID te zijn (moet 17-20 cijfers zijn, zonder <@ of @). Ongeldige waarden worden overgeslagen.`
+    );
+  }
+}
+
+// Unieke lijst: hardcoded ID + eventuele ID's uit .env.
+const MODERATOR_IDS = [...new Set([...HARDCODED_MODERATOR_IDS, ...envModeratorIds])];
+
+function moderatorMentions() {
+  return MODERATOR_IDS.map((id) => `<@${id}>`).join(" ");
 }
 
 // ---------- Persona: FantasieVeer ----------
@@ -112,7 +129,7 @@ Jouw personage (speel dit heel concreet uit, dit is wie je bent — niet alleen 
 - dit is onze website: https://www.fantasiecraft.nl
 - Bouwen in de wereld: spelers kunnen FantasieCraft alleen bezoeken en zelf NIET bouwen. Alleen spelers met de rol Owner, Co-Owner of Bouwer mogen bouwen. Als iemand vraagt of ze mogen bouwen, leg dit duidelijk uit.
 - Je mag alleen over FantasieCraft praten, niet over andere servers of games. Als iemand erover begint, zeg je vriendelijk dat je alleen FantasieCraft kent en dat ze het beste op de website van die andere server kunnen kijken.
-- Als iemand scheldt of grof is: zeg vriendelijk maar duidelijk dat we dat hier niet tolereren, en zet EXACT dit blokje aan het einde van je bericht: [TAG_MAKER] (dit wordt automatisch door het systeem vervangen door een echte tag van de maker — typ dit blokje zelf niet uit met andere tekst eromheen).
+- Als iemand scheldt of grof is: zeg vriendelijk maar duidelijk dat we dat hier niet tolereren, en zet EXACT dit blokje aan het einde van je bericht: [TAG_MAKER] (dit wordt automatisch door het systeem vervangen door een echte tag van het moderatie-team — typ dit blokje zelf niet uit met andere tekst eromheen).
 - Praat in de taal terug die naar je word gesproken (Maakt niet uit welke taal!). Je theatrale karakter en uitdrukkingen mag je vertalen naar die taal, zolang de persoonlijkheid hetzelfde blijft.
 `.trim();
 
@@ -177,7 +194,7 @@ function resetHistory(channelId) {
   scheduleSave();
 }
 
-// ---------- Simpele per-gebruiker cooldown (anti-spam) ----------
+// ---------- Simpele per-gebruiker cooldown (anti-spam voor de AI-quota) ----------
 const lastMessageAt = new Map(); // userId -> timestamp
 function isOnCooldown(userId) {
   const now = Date.now();
@@ -185,6 +202,37 @@ function isOnCooldown(userId) {
   if (now - last < COOLDOWN_MS) return true;
   lastMessageAt.set(userId, now);
   return false;
+}
+
+// ---------- Spamdetectie (om moderators te taggen) ----------
+// Dit is losgekoppeld van de AI-cooldown hierboven: dit checkt of iemand duidelijk
+// aan het spammen is (herhaalde identieke berichten, of een snelle stortvloed
+// aan berichten), zodat we de moderators erbij kunnen roepen — net als bij schelden.
+const spamTracker = new Map(); // userId -> { lastContent, repeatCount, timestamps }
+const SPAM_REPEAT_THRESHOLD = 3; // 3x hetzelfde bericht achter elkaar
+const SPAM_BURST_THRESHOLD = 6; // 6 berichten binnen het onderstaande venster
+const SPAM_BURST_WINDOW_MS = 10000; // 10 seconden
+
+function checkAndFlagSpam(userId, content) {
+  const now = Date.now();
+  const normalized = content.trim().toLowerCase();
+  const entry = spamTracker.get(userId) || { lastContent: null, repeatCount: 0, timestamps: [] };
+
+  entry.repeatCount = normalized && normalized === entry.lastContent ? entry.repeatCount + 1 : 1;
+  entry.lastContent = normalized;
+  entry.timestamps = [...entry.timestamps.filter((t) => now - t < SPAM_BURST_WINDOW_MS), now];
+
+  const isSpam =
+    entry.repeatCount >= SPAM_REPEAT_THRESHOLD || entry.timestamps.length >= SPAM_BURST_THRESHOLD;
+
+  if (isSpam) {
+    // Resetten zodat we niet op ieder volgend bericht opnieuw alarm slaan.
+    entry.repeatCount = 0;
+    entry.timestamps = [];
+  }
+
+  spamTracker.set(userId, entry);
+  return isSpam;
 }
 
 // ---------- Per-kanaal wachtrij ----------
@@ -274,11 +322,11 @@ async function askFantasieVeer(channelId, username, userMessage) {
     data?.choices?.[0]?.message?.content?.trim() ||
     "Hmm, mijn magische veerkracht laat me even in de steek... probeer het nog eens! ✨";
 
-  // De placeholder vervangen we hier in code door een echte Discord-mention.
+  // De placeholder vervangen we hier in code door echte Discord-mentions van alle moderators.
   const tagMakerPattern = /[<\[]\s*tag[_\s-]?maker\s*[>\]]/gi;
   if (tagMakerPattern.test(reply)) {
-    const moderatorMention = CLEAN_MODERATOR_ID ? `<@${CLEAN_MODERATOR_ID}>` : "de maker";
-    reply = reply.replace(/[<\[]\s*tag[_\s-]?maker\s*[>\]]/gi, moderatorMention).trim();
+    const mentions = moderatorMentions() || "het team";
+    reply = reply.replace(/[<\[]\s*tag[_\s-]?maker\s*[>\]]/gi, mentions).trim();
   }
 
   if (!reply) {
@@ -321,7 +369,7 @@ Blijf vriendelijk tegen elkaar, dan wordt het hier alleen maar magischer! ✨`;
 
 const HELP_MESSAGE = `🪶 **FantasieVeer commando's:**
 • \`!startbericht\` — toont het welkomstbericht
-• \`!reset\` — wist mijn geheugen van dit gesprek (alleen voor de maker/moderator)
+• \`!reset\` — wist mijn geheugen van dit gesprek (alleen voor moderators)
 • \`!help\` — toont dit berichtje`;
 
 // ---------- Discord bot ----------
@@ -356,9 +404,9 @@ client.once("clientReady", () => {
   console.log(`🧠 Onthoudt de laatste ${MAX_EXCHANGES} uitwisselingen per kanaal`);
   console.log(`⏱️  Cooldown per gebruiker: ${COOLDOWN_MS}ms`);
   console.log(
-    CLEAN_MODERATOR_ID
-      ? `🏷️  Tag-functie actief voor user-ID: ${CLEAN_MODERATOR_ID}`
-      : "🏷️  Tag-functie NIET actief (MODERATOR_USER_ID niet of ongeldig ingesteld)"
+    MODERATOR_IDS.length
+      ? `🏷️  Moderators die getagd worden bij spam/schelden: ${MODERATOR_IDS.join(", ")}`
+      : "🏷️  Geen moderators ingesteld om te taggen."
   );
   console.log(
     TARGET_CHANNEL_IDS.length
@@ -401,10 +449,10 @@ client.on("messageCreate", async (message) => {
   }
 
   if (trimmedContent === "!reset") {
-    const isAllowed = !CLEAN_MODERATOR_ID || message.author.id === CLEAN_MODERATOR_ID;
+    const isAllowed = !MODERATOR_IDS.length || MODERATOR_IDS.includes(message.author.id);
     if (!isAllowed) {
       try {
-        await sendAsVeer(message, "✨ Alleen de maker mag mijn geheugen wissen, sorry!");
+        await sendAsVeer(message, "✨ Alleen een moderator mag mijn geheugen wissen, sorry!");
       } catch {}
       return;
     }
@@ -418,7 +466,24 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  // ----- Anti-spam: cooldown per gebruiker -----
+  // ----- Spamdetectie: bij spam roepen we de moderators erbij, net als bij schelden -----
+  if (checkAndFlagSpam(message.author.id, message.content)) {
+    console.log(`🚨 Spam gedetecteerd van ${message.author.username} in ${message.channelId}.`);
+    const mentions = moderatorMentions() || "het team";
+    const mentionUsers = [...new Set([message.author.id, ...MODERATOR_IDS])];
+    try {
+      await sendAsVeer(
+        message,
+        `<@${message.author.id}> ✨ Hola, rustig aan met de berichtjes! Ik roep ${mentions} er even bij om een oogje in het zeil te houden.`,
+        { mentionUsers }
+      );
+    } catch (err) {
+      console.error("❌ Fout bij het versturen van de spamwaarschuwing:", err.message);
+    }
+    return;
+  }
+
+  // ----- Anti-spam voor de AI-quota: cooldown per gebruiker -----
   if (isOnCooldown(message.author.id)) {
     debugLog(`Cooldown actief voor ${message.author.username}, bericht overgeslagen.`);
     return;
@@ -456,9 +521,7 @@ client.on("messageCreate", async (message) => {
       const mentionUsers = [
         ...new Set([
           message.author.id,
-          ...(CLEAN_MODERATOR_ID && reply.includes(`<@${CLEAN_MODERATOR_ID}>`)
-            ? [CLEAN_MODERATOR_ID]
-            : []),
+          ...MODERATOR_IDS.filter((id) => reply.includes(`<@${id}>`)),
         ]),
       ];
       debugLog("Ping-lijst voor dit bericht:", mentionUsers);
