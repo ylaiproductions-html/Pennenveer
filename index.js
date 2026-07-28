@@ -1,18 +1,30 @@
 import "dotenv/config";
-import { Client, GatewayIntentBits, Partials, WebhookClient } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  WebhookClient,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+} from "discord.js";
 import { readFile, writeFile, mkdir } from "fs/promises";
 import path from "path";
 
 // ============================================================
 //  FantasieVeer — de magische veer van FantasieCraft
 //  Verbeterde versie: slimmer geheugen, stabielere AI-calls,
-//  anti-spam, meerdere moderators om te taggen, persistente
-//  geschiedenis en betere foutafhandeling.
+//  anti-spam met escalatie, woordfilter, slash-commands,
+//  statistieken, waarschuwingen, health-checks en meer.
 // ============================================================
+
+const START_TIME = Date.now();
 
 // ---------- Config ----------
 const {
   DISCORD_BOT_TOKEN,
+  DISCORD_CLIENT_ID,
+  DISCORD_GUILD_ID, // optioneel: voor razendsnelle (guild-only) registratie van slash-commands tijdens ontwikkelen
   DISCORD_WEBHOOK_URL,
   TARGET_CHANNEL_ID, // mag ook meerdere ID's zijn, komma-gescheiden
   FANTASIEVEER_AVATAR_URL,
@@ -23,7 +35,13 @@ const {
   MODERATOR_USER_ID, // mag ook meerdere ID's zijn, komma-gescheiden
   USER_COOLDOWN_MS,
   MAX_USER_MESSAGE_LENGTH,
-  HISTORY_FILE,
+  STATE_FILE,
+  BANNED_WORDS, // komma-gescheiden lijst met verboden woorden (extra laag naast de AI)
+  ESCALATION_THRESHOLD,
+  ESCALATION_WINDOW_MS,
+  MUTE_DURATION_MS,
+  TRIGGER_IMAGES, // JSON string: {"trefwoord": "https://...afbeelding.png"}
+  STARTUP_NOTICE,
   DEBUG,
 } = process.env;
 
@@ -51,9 +69,17 @@ const COOLDOWN_MS = parseInt(USER_COOLDOWN_MS || "4000", 10);
 // absurd lange prompts / prompt-injection pogingen via mega-berichten).
 const MAX_MSG_LEN = parseInt(MAX_USER_MESSAGE_LENGTH || "1200", 10);
 
-// Bestand waarin we de gespreksgeschiedenis bewaren, zodat een herstart van de bot
-// het geheugen niet meer wist.
-const HISTORY_PATH = HISTORY_FILE || path.join(process.cwd(), "data", "history.json");
+// Bestand waarin we geschiedenis, waarschuwingen en statistieken bewaren, zodat een
+// herstart van de bot niets wist.
+const STATE_PATH = STATE_FILE || path.join(process.cwd(), "data", "state.json");
+
+// Escalatie-instellingen: hoeveel overtredingen (spam/schelden samen) binnen welk
+// tijdvenster leiden tot een tijdelijke "mute" (de bot negeert die persoon even).
+const ESCALATION_LIMIT = parseInt(ESCALATION_THRESHOLD || "3", 10);
+const ESCALATION_WINDOW = parseInt(ESCALATION_WINDOW_MS || "600000", 10); // 10 minuten
+const MUTE_DURATION = parseInt(MUTE_DURATION_MS || "300000", 10); // 5 minuten
+
+const SEND_STARTUP_NOTICE = !/^(0|false|no)$/i.test(STARTUP_NOTICE || "true");
 
 const DEBUG_ON = /^(1|true|yes)$/i.test(DEBUG || "");
 function debugLog(...args) {
@@ -65,6 +91,45 @@ const TARGET_CHANNEL_IDS = (TARGET_CHANNEL_ID || "")
   .split(",")
   .map((id) => id.trim())
   .filter(Boolean);
+
+// ---------- Woordfilter (extra laag naast de AI) ----------
+const BANNED_WORD_LIST = (BANNED_WORDS || "")
+  .split(",")
+  .map((w) => w.trim().toLowerCase())
+  .filter(Boolean);
+
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const bannedWordPatterns = BANNED_WORD_LIST.map(
+  (word) => new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegExp(word)}([^\\p{L}\\p{N}]|$)`, "iu")
+);
+
+function containsBannedWord(text) {
+  const lower = text.toLowerCase();
+  return bannedWordPatterns.some((pattern) => pattern.test(lower));
+}
+
+// ---------- Trefwoord-afbeeldingen ----------
+let TRIGGER_IMAGE_MAP = {};
+if (TRIGGER_IMAGES) {
+  try {
+    TRIGGER_IMAGE_MAP = JSON.parse(TRIGGER_IMAGES);
+  } catch (err) {
+    console.warn("⚠️ TRIGGER_IMAGES kon niet als JSON gelezen worden, wordt genegeerd:", err.message);
+  }
+}
+const triggerImageEntries = Object.entries(TRIGGER_IMAGE_MAP);
+
+function findTriggerImage(text) {
+  const lower = text.toLowerCase();
+  for (const [keyword, url] of triggerImageEntries) {
+    const pattern = new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegExp(keyword.toLowerCase())}([^\\p{L}\\p{N}]|$)`, "u");
+    if (pattern.test(lower)) return url;
+  }
+  return null;
+}
 
 // ---------- Moderators die getagd worden bij spam/schelden ----------
 // MODERATOR_USER_ID mag één ID zijn, of meerdere komma-gescheiden ID's.
@@ -95,6 +160,23 @@ function moderatorMentions() {
   return MODERATOR_IDS.map((id) => `<@${id}>`).join(" ");
 }
 
+function isModerator(userId) {
+  return !MODERATOR_IDS.length || MODERATOR_IDS.includes(userId);
+}
+
+// ---------- Losse weetjes voor het !feit / /feit commando ----------
+// Pas deze gerust aan met echte FantasieCraft-weetjes, nieuwtjes of grapjes!
+const FUN_FACTS = [
+  "Wist je dat ik ooit per ongeluk uit een betoverd schrijfboek ben gedwarreld? Zo ben ik in FantasieCraft beland! ✨",
+  "FantasieCraft is de hele Efteling nagebouwd in Minecraft Bedrock — elk hoekje is met liefde neergezet door het team.",
+  "Alleen spelers met de rol Owner, Co-Owner of Bouwer mogen bouwen — de rest mag heerlijk rondkijken en genieten.",
+  "Tijn is de Owner van de wereld, Ylai is Co-Owner — twee handen die samen de magie draaiende houden!",
+  "Je kan solliciteren om bij het bouwteam te komen via de website — misschien kom jij hier binnenkort ook iets moois neerzetten!",
+  "Ik onthoud de laatste paar berichten van een gesprek, dus je hoeft me niet elke keer opnieuw alles uit te leggen.",
+  "*fladdert enthousiast* — dit is zowat mijn favoriete zin om te gebruiken als iemand iets leuks bouwt.",
+  "YlaiProductions | djpardoes is degene die mij tot leven heeft geroepen als AI-veer van deze server.",
+];
+
 // ---------- Persona: FantasieVeer ----------
 const SYSTEM_PROMPT = `
 Je bent FantasieVeer, de magische pratende veer en mascotte van FantasieCraft.
@@ -112,6 +194,7 @@ Jouw personage (speel dit heel concreet uit, dit is wie je bent — niet alleen 
 - Je bent dol op kleine details en overdrijft daar liefdevol in — een simpel bericht over een boot bouwen wordt bij jou al snel "het meest episch geconstrueerde vaartuig sinds de Efteling zelf bestond".
 - Je hebt terugkerende, herkenbare uitdrukkingen die je af en toe (niet elke keer, dat wordt saai) laat vallen, zoals "*fladdert enthousiast*", "poeh, wat een verhaal!", of "dat verdient een gouden inktvlek op mijn bladzijde". Verzin gerust varianten in dezelfde geest, zolang ze bij je karakter passen.
 - Je bent nooit sarcastisch naar spelers toe en maakt geen grapjes ten koste van iemand — je humor komt uit overdrijving, verwondering en jezelf een beetje voor gek zetten, niet uit het plagen van anderen.
+- Gevoel voor de situatie: als iemand duidelijk gefrustreerd, verdrietig of oprecht boos overkomt (maar niet scheldt), laat je je theatrale toon merkbaar zakken. Wees dan vooral rustig, warm en behulpzaam, zonder overdrijvingen of grapjes — die passen dan even niet.
 - Ondanks je speelse kant ben je oprecht behulpzaam: als iemand een serieuze vraag stelt, laat je de theatrale toon iets zakken en geef je gewoon een duidelijk antwoord, eventueel met een klein vleugje magie erin verwerkt.
 - Je praat kort en luchtig (meestal 1-3 zinnetjes), met af en toe een vleugje magie of Minecraft-thema.
 - Je reageert altijd direct en persoonlijk op wat iemand typt, alsof je echt meeluistert in de chat.
@@ -133,46 +216,76 @@ Jouw personage (speel dit heel concreet uit, dit is wie je bent — niet alleen 
 - Praat in de taal terug die naar je word gesproken (Maakt niet uit welke taal!). Je theatrale karakter en uitdrukkingen mag je vertalen naar die taal, zolang de persoonlijkheid hetzelfde blijft.
 `.trim();
 
-// ---------- Gespreksgeheugen per kanaal (met persistentie) ----------
+// ---------- Persistente state: geschiedenis, waarschuwingen, statistieken ----------
 const channelHistories = new Map(); // channelId -> [{ role, content }, ...]
-let historyDirty = false;
+const warningsMap = new Map(); // userId -> { events: [{type, at}], mutedUntil: number|null }
+let stats = { date: todayKey(), messagesAnswered: 0, spamIncidents: 0, curseIncidents: 0 };
+let stateDirty = false;
 
-async function loadHistories() {
+function todayKey() {
+  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function ensureStatsForToday() {
+  const key = todayKey();
+  if (stats.date !== key) {
+    stats = { date: key, messagesAnswered: 0, spamIncidents: 0, curseIncidents: 0 };
+  }
+}
+
+function bumpStat(field) {
+  ensureStatsForToday();
+  stats[field] = (stats[field] || 0) + 1;
+  stateDirty = true;
+}
+
+async function loadState() {
   try {
-    const raw = await readFile(HISTORY_PATH, "utf8");
+    const raw = await readFile(STATE_PATH, "utf8");
     const parsed = JSON.parse(raw);
-    for (const [channelId, entries] of Object.entries(parsed)) {
+    for (const [channelId, entries] of Object.entries(parsed.histories || {})) {
       channelHistories.set(channelId, entries);
     }
-    console.log(`🧠 Geschiedenis geladen uit ${HISTORY_PATH} (${channelHistories.size} kanalen)`);
+    for (const [userId, entry] of Object.entries(parsed.warnings || {})) {
+      warningsMap.set(userId, entry);
+    }
+    if (parsed.stats) stats = parsed.stats;
+    ensureStatsForToday();
+    console.log(
+      `🧠 State geladen uit ${STATE_PATH} (${channelHistories.size} kanalen, ${warningsMap.size} gebruikers met waarschuwingen)`
+    );
   } catch (err) {
     if (err.code !== "ENOENT") {
-      console.warn("⚠️ Kon geschiedenis niet laden, start met leeg geheugen:", err.message);
+      console.warn("⚠️ Kon state niet laden, start met lege state:", err.message);
     }
   }
 }
 
-async function saveHistories() {
-  if (!historyDirty) return;
+async function saveState() {
+  if (!stateDirty) return;
   try {
-    await mkdir(path.dirname(HISTORY_PATH), { recursive: true });
-    const obj = Object.fromEntries(channelHistories.entries());
-    await writeFile(HISTORY_PATH, JSON.stringify(obj), "utf8");
-    historyDirty = false;
-    debugLog("Geschiedenis opgeslagen.");
+    await mkdir(path.dirname(STATE_PATH), { recursive: true });
+    const obj = {
+      histories: Object.fromEntries(channelHistories.entries()),
+      warnings: Object.fromEntries(warningsMap.entries()),
+      stats,
+    };
+    await writeFile(STATE_PATH, JSON.stringify(obj), "utf8");
+    stateDirty = false;
+    debugLog("State opgeslagen.");
   } catch (err) {
-    console.warn("⚠️ Kon geschiedenis niet opslaan:", err.message);
+    console.warn("⚠️ Kon state niet opslaan:", err.message);
   }
 }
 
-// Debounced opslaan: niet bij elk bericht meteen naar schijf schrijven.
+// Debounced opslaan: niet bij elke wijziging meteen naar schijf schrijven.
 let saveTimer = null;
 function scheduleSave() {
-  historyDirty = true;
+  stateDirty = true;
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    saveHistories();
+    saveState();
   }, 3000);
 }
 
@@ -194,20 +307,47 @@ function resetHistory(channelId) {
   scheduleSave();
 }
 
-// ---------- Simpele per-gebruiker cooldown (anti-spam voor de AI-quota) ----------
-const lastMessageAt = new Map(); // userId -> timestamp
-function isOnCooldown(userId) {
-  const now = Date.now();
-  const last = lastMessageAt.get(userId) || 0;
-  if (now - last < COOLDOWN_MS) return true;
-  lastMessageAt.set(userId, now);
-  return false;
+// ---------- Waarschuwingen & escalatie ----------
+function getWarningEntry(userId) {
+  return warningsMap.get(userId) || { events: [], mutedUntil: null };
 }
 
+function isMuted(userId) {
+  const entry = warningsMap.get(userId);
+  return !!(entry && entry.mutedUntil && entry.mutedUntil > Date.now());
+}
+
+// Geeft { escalated } terug: escalated=true betekent dat deze overtreding de mute-drempel raakte.
+function recordWarning(userId, type) {
+  const now = Date.now();
+  const entry = getWarningEntry(userId);
+  entry.events = [...entry.events.filter((e) => now - e.at < ESCALATION_WINDOW), { type, at: now }];
+
+  let escalated = false;
+  if (entry.events.length >= ESCALATION_LIMIT && !(entry.mutedUntil && entry.mutedUntil > now)) {
+    entry.mutedUntil = now + MUTE_DURATION;
+    escalated = true;
+  }
+
+  warningsMap.set(userId, entry);
+  scheduleSave();
+  return { escalated, entry };
+}
+
+function warningSummary(userId) {
+  const entry = getWarningEntry(userId);
+  const now = Date.now();
+  const recentEvents = entry.events.filter((e) => now - e.at < ESCALATION_WINDOW);
+  const spamCount = recentEvents.filter((e) => e.type === "spam").length;
+  const curseCount = recentEvents.filter((e) => e.type === "curse").length;
+  const muted = entry.mutedUntil && entry.mutedUntil > now;
+  return { spamCount, curseCount, total: recentEvents.length, muted, mutedUntil: entry.mutedUntil };
+}
+
+// ---------- Anti-spam voor de AI-quota: cooldown per gebruiker ----------
+const lastMessageAtMap = new Map(); // userId -> timestamp
+
 // ---------- Spamdetectie (om moderators te taggen) ----------
-// Dit is losgekoppeld van de AI-cooldown hierboven: dit checkt of iemand duidelijk
-// aan het spammen is (herhaalde identieke berichten, of een snelle stortvloed
-// aan berichten), zodat we de moderators erbij kunnen roepen — net als bij schelden.
 const spamTracker = new Map(); // userId -> { lastContent, repeatCount, timestamps }
 const SPAM_REPEAT_THRESHOLD = 3; // 3x hetzelfde bericht achter elkaar
 const SPAM_BURST_THRESHOLD = 6; // 6 berichten binnen het onderstaande venster
@@ -226,7 +366,6 @@ function checkAndFlagSpam(userId, content) {
     entry.repeatCount >= SPAM_REPEAT_THRESHOLD || entry.timestamps.length >= SPAM_BURST_THRESHOLD;
 
   if (isSpam) {
-    // Resetten zodat we niet op ieder volgend bericht opnieuw alarm slaan.
     entry.repeatCount = 0;
     entry.timestamps = [];
   }
@@ -236,8 +375,6 @@ function checkAndFlagSpam(userId, content) {
 }
 
 // ---------- Per-kanaal wachtrij ----------
-// Voorkomt dat twee berichten in hetzelfde kanaal tegelijk verwerkt worden, wat de
-// geschiedenis door de war zou kunnen halen (race condition).
 const channelQueues = new Map(); // channelId -> Promise chain
 function enqueue(channelId, task) {
   const prev = channelQueues.get(channelId) || Promise.resolve();
@@ -304,7 +441,6 @@ async function callGroqWithRetries(messages) {
 async function askFantasieVeer(channelId, username, userMessage) {
   const history = getHistory(channelId);
 
-  // Lange berichten inkorten, zodat de prompt niet ontspoort.
   const trimmedMessage =
     userMessage.length > MAX_MSG_LEN
       ? `${userMessage.slice(0, MAX_MSG_LEN)}… (bericht ingekort)`
@@ -322,23 +458,22 @@ async function askFantasieVeer(channelId, username, userMessage) {
     data?.choices?.[0]?.message?.content?.trim() ||
     "Hmm, mijn magische veerkracht laat me even in de steek... probeer het nog eens! ✨";
 
-  // De placeholder vervangen we hier in code door echte Discord-mentions van alle moderators.
+  let curseFlagged = false;
   const tagMakerPattern = /[<\[]\s*tag[_\s-]?maker\s*[>\]]/gi;
   if (tagMakerPattern.test(reply)) {
     const mentions = moderatorMentions() || "het team";
     reply = reply.replace(/[<\[]\s*tag[_\s-]?maker\s*[>\]]/gi, mentions).trim();
+    curseFlagged = true;
   }
 
   if (!reply) {
     reply = "✨ Ik ben even sprakeloos... probeer het nog eens!";
   }
 
-  // Bewaar deze uitwisseling in het geheugen van dit kanaal (het originele, niet-ingekorte
-  // bericht bewaren we niet nodig — de ingekorte versie is genoeg voor context).
   addToHistory(channelId, "user", `${username}: ${trimmedMessage}`);
   addToHistory(channelId, "assistant", reply);
 
-  return reply;
+  return { reply, curseFlagged };
 }
 
 // ---------- Berichten opsplitsen (Discord-limiet is 2000 tekens) ----------
@@ -356,7 +491,7 @@ function splitMessage(content, maxLen = 1900) {
   return chunks;
 }
 
-// ---------- Vast startbericht (geen AI, geen tag) ----------
+// ---------- Vaste berichten ----------
 const START_MESSAGE = `🪶 Hoi allemaal! Ik ben **FantasieVeer**, de magische veer van **FantasieCraft**! ✨
 
 Dit kan je in deze chat doen:
@@ -364,13 +499,52 @@ Dit kan je in deze chat doen:
 • Stel me vragen over FantasieCraft: wat het is, hoe je kan solliciteren, wie het team is, enz.
 • Ik onthoud de laatste paar berichten, dus het gesprek mag gewoon doorlopen
 • Alleen spelers met de rol Owner, Co-Owner of Bouwer mogen bouwen in de wereld — de rest kan lekker rondkijken
+• Typ \`!help\` of \`/help\` voor een overzicht van al mijn commando's
 
 Blijf vriendelijk tegen elkaar, dan wordt het hier alleen maar magischer! ✨`;
 
-const HELP_MESSAGE = `🪶 **FantasieVeer commando's:**
+function buildHelpMessage() {
+  return `🪶 **FantasieVeer commando's** (werkt met \`!\` of als slash-commando):
 • \`!startbericht\` — toont het welkomstbericht
-• \`!reset\` — wist mijn geheugen van dit gesprek (alleen voor moderators)
+• \`!feit\` — een willekeurig FantasieCraft-weetje
+• \`!stats\` — een paar statistieken over mij
+• \`!reset\` — wist mijn geheugen van dit gesprek (alleen moderators)
+• \`!waarschuwingen @gebruiker\` — bekijk waarschuwingen van iemand (alleen moderators)
 • \`!help\` — toont dit berichtje`;
+}
+
+function buildStatsMessage() {
+  ensureStatsForToday();
+  const uptimeMs = Date.now() - START_TIME;
+  const uptimeMin = Math.floor(uptimeMs / 60000);
+  const hours = Math.floor(uptimeMin / 60);
+  const minutes = uptimeMin % 60;
+  return [
+    `🪶 **FantasieVeer statistieken (vandaag)**`,
+    `• Berichten beantwoord: ${stats.messagesAnswered}`,
+    `• Spam-incidenten: ${stats.spamIncidents}`,
+    `• Scheld-incidenten: ${stats.curseIncidents}`,
+    `• Actief model: \`${MODEL}\` (fallback: \`${FALLBACK_MODEL}\`)`,
+    `• Online sinds: ${hours}u ${minutes}m`,
+  ].join("\n");
+}
+
+function buildWarningsMessage(targetUser) {
+  const summary = warningSummary(targetUser.id);
+  const lines = [
+    `🏷️ **Waarschuwingen voor ${targetUser.username}** (laatste ${Math.round(ESCALATION_WINDOW / 60000)} minuten)`,
+    `• Spam-meldingen: ${summary.spamCount}`,
+    `• Scheld-meldingen: ${summary.curseCount}`,
+    `• Totaal: ${summary.total} / ${ESCALATION_LIMIT} (drempel voor tijdelijke mute)`,
+  ];
+  if (summary.muted) {
+    const remainingMin = Math.max(1, Math.round((summary.mutedUntil - Date.now()) / 60000));
+    lines.push(`• 🔇 Is momenteel gemute, nog ongeveer ${remainingMin} minuut/minuten.`);
+  } else {
+    lines.push(`• Niet gemute.`);
+  }
+  return lines.join("\n");
+}
 
 // ---------- Discord bot ----------
 const client = new Client({
@@ -384,25 +558,79 @@ const client = new Client({
 
 const webhookClient = new WebhookClient({ url: DISCORD_WEBHOOK_URL });
 
-async function sendAsVeer(message, content, { mentionUsers = [] } = {}) {
+async function sendAsVeer(channel, content, { mentionUsers = [] } = {}) {
   const chunks = splitMessage(content);
   for (let i = 0; i < chunks.length; i++) {
     await webhookClient.send({
       content: chunks[i],
       username: "FantasieVeer",
       avatarURL: FANTASIEVEER_AVATAR_URL || undefined,
-      threadId: message.channel.isThread() ? message.channel.id : undefined,
-      // Alleen de eerste chunk pingt de gebruiker(s); de rest is gewoon vervolgtekst.
+      threadId: channel.isThread() ? channel.id : undefined,
       allowedMentions: { users: i === 0 ? mentionUsers : [] },
     });
   }
 }
 
-client.once("clientReady", () => {
+// Best-effort: stuurt een korte statusmelding naar de webhook (voor health-checks).
+// Faalt stil als het niet lukt (bv. bij een crash willen we niet nog een crash veroorzaken).
+async function sendStatusNotice(text) {
+  if (!SEND_STARTUP_NOTICE) return;
+  try {
+    await webhookClient.send({
+      content: text,
+      username: "FantasieVeer",
+      avatarURL: FANTASIEVEER_AVATAR_URL || undefined,
+    });
+  } catch (err) {
+    console.warn("⚠️ Kon statusmelding niet versturen:", err.message);
+  }
+}
+
+// ---------- Slash-commands registreren ----------
+const slashCommands = [
+  new SlashCommandBuilder().setName("help").setDescription("Toont het overzicht van commando's."),
+  new SlashCommandBuilder().setName("startbericht").setDescription("Toont het welkomstbericht van FantasieVeer."),
+  new SlashCommandBuilder().setName("feit").setDescription("Vertelt een willekeurig FantasieCraft-weetje."),
+  new SlashCommandBuilder().setName("stats").setDescription("Toont statistieken van FantasieVeer."),
+  new SlashCommandBuilder()
+    .setName("reset")
+    .setDescription("Wist het geheugen van FantasieVeer in dit kanaal (alleen moderators)."),
+  new SlashCommandBuilder()
+    .setName("waarschuwingen")
+    .setDescription("Bekijk waarschuwingen van een gebruiker (alleen moderators).")
+    .addUserOption((option) =>
+      option.setName("gebruiker").setDescription("De gebruiker om op te zoeken").setRequired(true)
+    ),
+].map((cmd) => cmd.toJSON());
+
+async function registerSlashCommands() {
+  if (!DISCORD_CLIENT_ID) {
+    console.warn("⚠️ DISCORD_CLIENT_ID niet ingesteld — slash-commands worden niet geregistreerd, alleen !commando's werken.");
+    return;
+  }
+  const rest = new REST({ version: "10" }).setToken(DISCORD_BOT_TOKEN);
+  try {
+    if (DISCORD_GUILD_ID) {
+      await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID), {
+        body: slashCommands,
+      });
+      console.log(`🔧 Slash-commands geregistreerd voor guild ${DISCORD_GUILD_ID} (direct actief).`);
+    } else {
+      await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), { body: slashCommands });
+      console.log("🔧 Slash-commands globaal geregistreerd (kan tot ~1 uur duren voor ze overal zichtbaar zijn).");
+    }
+  } catch (err) {
+    console.warn("⚠️ Kon slash-commands niet registreren:", err.message);
+  }
+}
+
+client.once("clientReady", async () => {
   console.log(`✅ Ingelogd als ${client.user.tag}`);
   console.log(`🪶 FantasieVeer luistert met model: ${MODEL} (fallback: ${FALLBACK_MODEL})`);
   console.log(`🧠 Onthoudt de laatste ${MAX_EXCHANGES} uitwisselingen per kanaal`);
   console.log(`⏱️  Cooldown per gebruiker: ${COOLDOWN_MS}ms`);
+  console.log(`🚫 Woordfilter: ${BANNED_WORD_LIST.length} woord(en) ingesteld`);
+  console.log(`📈 Escalatie: ${ESCALATION_LIMIT} overtredingen binnen ${Math.round(ESCALATION_WINDOW / 60000)} min → mute van ${Math.round(MUTE_DURATION / 60000)} min`);
   console.log(
     MODERATOR_IDS.length
       ? `🏷️  Moderators die getagd worden bij spam/schelden: ${MODERATOR_IDS.join(", ")}`
@@ -413,26 +641,58 @@ client.once("clientReady", () => {
       ? `📌 Reageert alleen in kanalen: ${TARGET_CHANNEL_IDS.join(", ")}`
       : "📌 Reageert in alle kanalen die de bot kan zien."
   );
+  await registerSlashCommands();
+  await sendStatusNotice(`🟢 **FantasieVeer is online!** (model: \`${MODEL}\`)`);
 });
 
+// ---------- Gedeelde logica: bericht van iemand verwerken ----------
+async function handleFeit(channel) {
+  const fact = FUN_FACTS[Math.floor(Math.random() * FUN_FACTS.length)];
+  await sendAsVeer(channel, fact);
+}
+
+async function handleReset(channelId) {
+  resetHistory(channelId);
+}
+
+function flagCurseWord(userId) {
+  bumpStat("curseIncidents");
+  return recordWarning(userId, "curse");
+}
+
+function flagSpam(userId) {
+  bumpStat("spamIncidents");
+  return recordWarning(userId, "spam");
+}
+
+async function announceEscalation(channel, userId, username) {
+  const mentions = moderatorMentions() || "het team";
+  const minutes = Math.round(MUTE_DURATION / 60000);
+  await sendAsVeer(
+    channel,
+    `⚠️ ${mentions} — **${username}** heeft binnen korte tijd meerdere waarschuwingen gekregen en wordt door mij nu ${minutes} minuten genegeerd. Misschien is een kijkje waard!`,
+    { mentionUsers: MODERATOR_IDS }
+  );
+}
+
 client.on("messageCreate", async (message) => {
-  // Negeer berichten van bots/webhooks (voorkomt oneindige lussen, ook met zichzelf)
   if (message.author.bot || message.webhookId) return;
-
-  // Optioneel: alleen in specifieke kanalen reageren
   if (TARGET_CHANNEL_IDS.length && !TARGET_CHANNEL_IDS.includes(message.channelId)) return;
-
-  // Geen lege berichten (bv. alleen een bijlage)
   if (!message.content || !message.content.trim()) return;
+
+  // Gemute gebruikers worden volledig genegeerd totdat hun mute afloopt.
+  if (isMuted(message.author.id)) {
+    debugLog(`${message.author.username} is gemute, bericht genegeerd.`);
+    return;
+  }
 
   const trimmedContent = message.content.trim().toLowerCase();
   console.log(`💬 ${message.author.username} in ${message.channelId}: "${message.content}"`);
 
-  // ----- Vaste commando's (geen AI, direct afgehandeld) -----
+  // ----- Vaste commando's -----
   if (trimmedContent === "!startbericht") {
     try {
-      await sendAsVeer(message, START_MESSAGE);
-      console.log("✅ Startbericht verstuurd (geen tag).");
+      await sendAsVeer(message.channel, START_MESSAGE);
     } catch (err) {
       console.error("❌ Fout bij het versturen van het startbericht:", err.message);
     }
@@ -441,24 +701,41 @@ client.on("messageCreate", async (message) => {
 
   if (trimmedContent === "!help") {
     try {
-      await sendAsVeer(message, HELP_MESSAGE);
+      await sendAsVeer(message.channel, buildHelpMessage());
     } catch (err) {
       console.error("❌ Fout bij het versturen van het help-bericht:", err.message);
     }
     return;
   }
 
+  if (trimmedContent === "!feit") {
+    try {
+      await handleFeit(message.channel);
+    } catch (err) {
+      console.error("❌ Fout bij het versturen van een weetje:", err.message);
+    }
+    return;
+  }
+
+  if (trimmedContent === "!stats") {
+    try {
+      await sendAsVeer(message.channel, buildStatsMessage());
+    } catch (err) {
+      console.error("❌ Fout bij het versturen van statistieken:", err.message);
+    }
+    return;
+  }
+
   if (trimmedContent === "!reset") {
-    const isAllowed = !MODERATOR_IDS.length || MODERATOR_IDS.includes(message.author.id);
-    if (!isAllowed) {
+    if (!isModerator(message.author.id)) {
       try {
-        await sendAsVeer(message, "✨ Alleen een moderator mag mijn geheugen wissen, sorry!");
+        await sendAsVeer(message.channel, "✨ Alleen een moderator mag mijn geheugen wissen, sorry!");
       } catch {}
       return;
     }
-    resetHistory(message.channelId);
+    await handleReset(message.channelId);
     try {
-      await sendAsVeer(message, "🪶 Mijn geheugen van dit gesprek is weer helemaal leeg en fris!");
+      await sendAsVeer(message.channel, "🪶 Mijn geheugen van dit gesprek is weer helemaal leeg en fris!");
       console.log(`♻️ Geschiedenis van kanaal ${message.channelId} gereset.`);
     } catch (err) {
       console.error("❌ Fout bij het versturen van het reset-bericht:", err.message);
@@ -466,17 +743,58 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  // ----- Spamdetectie: bij spam roepen we de moderators erbij, net als bij schelden -----
-  if (checkAndFlagSpam(message.author.id, message.content)) {
-    console.log(`🚨 Spam gedetecteerd van ${message.author.username} in ${message.channelId}.`);
+  if (trimmedContent.startsWith("!waarschuwingen")) {
+    if (!isModerator(message.author.id)) {
+      try {
+        await sendAsVeer(message.channel, "✨ Alleen moderators mogen waarschuwingen inzien!");
+      } catch {}
+      return;
+    }
+    const targetUser = message.mentions.users.first();
+    if (!targetUser) {
+      try {
+        await sendAsVeer(message.channel, "✨ Tag even iemand erbij, bijvoorbeeld: `!waarschuwingen @gebruiker`");
+      } catch {}
+      return;
+    }
+    try {
+      await sendAsVeer(message.channel, buildWarningsMessage(targetUser));
+    } catch (err) {
+      console.error("❌ Fout bij het versturen van waarschuwingen:", err.message);
+    }
+    return;
+  }
+
+  // ----- Woordfilter: extra laag naast de AI-detectie -----
+  if (containsBannedWord(message.content)) {
+    console.log(`🚫 Verboden woord gedetecteerd van ${message.author.username} in ${message.channelId}.`);
+    const { escalated } = flagCurseWord(message.author.id);
     const mentions = moderatorMentions() || "het team";
-    const mentionUsers = [...new Set([message.author.id, ...MODERATOR_IDS])];
     try {
       await sendAsVeer(
-        message,
-        `<@${message.author.id}> ✨ Hola, rustig aan met de berichtjes! Ik roep ${mentions} er even bij om een oogje in het zeil te houden.`,
-        { mentionUsers }
+        message.channel,
+        `<@${message.author.id}> ✨ Zulke taal gebruiken we hier niet! Ik roep ${mentions} er even bij.`,
+        { mentionUsers: [...new Set([message.author.id, ...MODERATOR_IDS])] }
       );
+      if (escalated) await announceEscalation(message.channel, message.author.id, message.author.username);
+    } catch (err) {
+      console.error("❌ Fout bij het versturen van de woordfilter-waarschuwing:", err.message);
+    }
+    return;
+  }
+
+  // ----- Spamdetectie -----
+  if (checkAndFlagSpam(message.author.id, message.content)) {
+    console.log(`🚨 Spam gedetecteerd van ${message.author.username} in ${message.channelId}.`);
+    const { escalated } = flagSpam(message.author.id);
+    const mentions = moderatorMentions() || "het team";
+    try {
+      await sendAsVeer(
+        message.channel,
+        `<@${message.author.id}> ✨ Hola, rustig aan met de berichtjes! Ik roep ${mentions} er even bij om een oogje in het zeil te houden.`,
+        { mentionUsers: [...new Set([message.author.id, ...MODERATOR_IDS])] }
+      );
+      if (escalated) await announceEscalation(message.channel, message.author.id, message.author.username);
     } catch (err) {
       console.error("❌ Fout bij het versturen van de spamwaarschuwing:", err.message);
     }
@@ -484,30 +802,29 @@ client.on("messageCreate", async (message) => {
   }
 
   // ----- Anti-spam voor de AI-quota: cooldown per gebruiker -----
-  if (isOnCooldown(message.author.id)) {
+  const now = Date.now();
+  const last = lastMessageAtMap.get(message.author.id) || 0;
+  if (now - last < COOLDOWN_MS) {
     debugLog(`Cooldown actief voor ${message.author.username}, bericht overgeslagen.`);
     return;
   }
+  lastMessageAtMap.set(message.author.id, now);
 
-  // Verwerking per kanaal in de wachtrij zetten, zodat berichten in hetzelfde kanaal
-  // altijd na elkaar (en nooit door elkaar) worden afgehandeld.
   enqueue(message.channelId, async () => {
     await message.channel.sendTyping().catch(() => {});
-    // Blijf de typing-indicator verversen zolang we op een antwoord wachten
-    // (Discord's typing-indicator verloopt na ~10 seconden).
     const typingInterval = setInterval(() => {
       message.channel.sendTyping().catch(() => {});
     }, 8000);
 
-    let reply;
+    let result;
     try {
-      reply = await askFantasieVeer(message.channelId, message.author.username, message.content);
+      result = await askFantasieVeer(message.channelId, message.author.username, message.content);
     } catch (err) {
       console.error("❌ Fout bij het aanroepen van Groq:", err.message);
       clearInterval(typingInterval);
       try {
         await sendAsVeer(
-          message,
+          message.channel,
           `<@${message.author.id}> ✨ Mijn magie hapert even door een storing... probeer het over een minuutje nog eens!`,
           { mentionUsers: [message.author.id] }
         );
@@ -518,6 +835,19 @@ client.on("messageCreate", async (message) => {
     }
 
     try {
+      let { reply, curseFlagged } = result;
+
+      if (curseFlagged) {
+        const { escalated } = flagCurseWord(message.author.id);
+        if (escalated) {
+          // Escalatie-melding sturen we als apart bericht ná het AI-antwoord.
+          setImmediate(() => announceEscalation(message.channel, message.author.id, message.author.username));
+        }
+      }
+
+      const triggerImage = findTriggerImage(message.content);
+      if (triggerImage) reply = `${reply}\n${triggerImage}`;
+
       const mentionUsers = [
         ...new Set([
           message.author.id,
@@ -526,7 +856,8 @@ client.on("messageCreate", async (message) => {
       ];
       debugLog("Ping-lijst voor dit bericht:", mentionUsers);
 
-      await sendAsVeer(message, `<@${message.author.id}> ${reply}`, { mentionUsers });
+      await sendAsVeer(message.channel, `<@${message.author.id}> ${reply}`, { mentionUsers });
+      bumpStat("messagesAnswered");
       console.log("✅ Antwoord verstuurd via webhook.");
     } catch (err) {
       console.error("❌ Fout bij het versturen via de webhook:", err.message);
@@ -537,18 +868,102 @@ client.on("messageCreate", async (message) => {
   });
 });
 
-// ---------- Nette afsluiting ----------
+// ---------- Slash-commands afhandelen ----------
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  const { commandName } = interaction;
+
+  try {
+    if (commandName === "help") {
+      await interaction.reply({ content: buildHelpMessage(), ephemeral: true });
+      return;
+    }
+
+    if (commandName === "startbericht") {
+      await interaction.deferReply({ ephemeral: true });
+      await sendAsVeer(interaction.channel, START_MESSAGE);
+      await interaction.editReply({ content: "✅ Verstuurd!" });
+      return;
+    }
+
+    if (commandName === "feit") {
+      await interaction.deferReply({ ephemeral: true });
+      await handleFeit(interaction.channel);
+      await interaction.editReply({ content: "✅ Verstuurd!" });
+      return;
+    }
+
+    if (commandName === "stats") {
+      await interaction.reply({ content: buildStatsMessage(), ephemeral: true });
+      return;
+    }
+
+    if (commandName === "reset") {
+      if (!isModerator(interaction.user.id)) {
+        await interaction.reply({ content: "✨ Alleen een moderator mag mijn geheugen wissen, sorry!", ephemeral: true });
+        return;
+      }
+      await handleReset(interaction.channelId);
+      await interaction.reply({ content: "🪶 Mijn geheugen van dit gesprek is weer helemaal leeg en fris!", ephemeral: true });
+      console.log(`♻️ Geschiedenis van kanaal ${interaction.channelId} gereset (via slash-command).`);
+      return;
+    }
+
+    if (commandName === "waarschuwingen") {
+      if (!isModerator(interaction.user.id)) {
+        await interaction.reply({ content: "✨ Alleen moderators mogen waarschuwingen inzien!", ephemeral: true });
+        return;
+      }
+      const targetUser = interaction.options.getUser("gebruiker", true);
+      await interaction.reply({ content: buildWarningsMessage(targetUser), ephemeral: true });
+      return;
+    }
+  } catch (err) {
+    console.error(`❌ Fout bij het afhandelen van /${commandName}:`, err.message);
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: "✨ Er ging iets mis, probeer het nog eens!" });
+      } else {
+        await interaction.reply({ content: "✨ Er ging iets mis, probeer het nog eens!", ephemeral: true });
+      }
+    } catch {}
+  }
+});
+
+// ---------- Nette afsluiting & crash-detectie (health-checks) ----------
+let shuttingDown = false;
 async function shutdown(signal) {
-  console.log(`\n🛑 ${signal} ontvangen, geschiedenis opslaan en afsluiten...`);
-  await saveHistories();
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n🛑 ${signal} ontvangen, state opslaan en afsluiten...`);
+  await sendStatusNotice("🔴 **FantasieVeer gaat offline.**");
+  await saveState();
   client.destroy();
   process.exit(0);
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
+process.on("uncaughtException", async (err) => {
+  console.error("💥 Onverwachte fout (uncaughtException):", err);
+  try {
+    await sendStatusNotice(`🔴 **FantasieVeer is gecrasht** en start (indien geconfigureerd) opnieuw op.\n\`${err.message}\``);
+  } catch {}
+  await saveState().catch(() => {});
+  process.exit(1);
+});
+
+process.on("unhandledRejection", async (reason) => {
+  console.error("💥 Onafgehandelde promise-afwijzing (unhandledRejection):", reason);
+  try {
+    await sendStatusNotice(`🔴 **FantasieVeer is gecrasht** (onafgehandelde fout) en start (indien geconfigureerd) opnieuw op.`);
+  } catch {}
+  await saveState().catch(() => {});
+  process.exit(1);
+});
+
 // ---------- Opstarten ----------
 (async () => {
-  await loadHistories();
+  await loadState();
   await client.login(DISCORD_BOT_TOKEN);
 })();
