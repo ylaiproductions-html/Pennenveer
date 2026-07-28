@@ -7,6 +7,7 @@ import {
   REST,
   Routes,
   SlashCommandBuilder,
+  PermissionFlagsBits,
 } from "discord.js";
 import { readFile, writeFile, mkdir } from "fs/promises";
 import path from "path";
@@ -510,6 +511,7 @@ function buildHelpMessage() {
 • \`!stats\` — een paar statistieken over mij
 • \`!reset\` — wist mijn geheugen van dit gesprek (alleen moderators)
 • \`!waarschuwingen @gebruiker\` — bekijk waarschuwingen van iemand (alleen moderators)
+• \`!wis [aantal]\` — verwijdert berichten van iedereen (ook van mijzelf) uit dit kanaal (alleen moderators)
 • \`!help\` — toont dit berichtje`;
 }
 
@@ -571,6 +573,41 @@ async function sendAsVeer(channel, content, { mentionUsers = [] } = {}) {
   }
 }
 
+// ---------- Berichten wissen (!wis / /wis) ----------
+// Discord's bulkDelete werkt alleen voor berichten die korter dan 14 dagen oud zijn,
+// en maximaal 100 per aanroep — daarom lussen we net zo lang tot alles weg is of we
+// oudere berichten tegenkomen (die moeten via Discord zelf handmatig verwijderd worden).
+const MAX_WIPE_LIMIT = 1000; // veiligheidsgrens, ook al vraagt iemand meer
+
+async function purgeChannel(channel, requestedAmount) {
+  const limit = Math.max(1, Math.min(requestedAmount, MAX_WIPE_LIMIT));
+  let deletedTotal = 0;
+  let hitOldMessages = false;
+
+  while (deletedTotal < limit) {
+    const batchSize = Math.min(100, limit - deletedTotal);
+    const fetched = await channel.messages.fetch({ limit: batchSize });
+    if (fetched.size === 0) break;
+
+    const deleted = await channel.bulkDelete(fetched, true); // true = negeer berichten ouder dan 14 dagen
+    deletedTotal += deleted.size;
+
+    if (deleted.size < fetched.size) {
+      hitOldMessages = true;
+      break; // de rest is ouder dan 14 dagen, bulkDelete kan daar niets meer mee
+    }
+    if (fetched.size < batchSize) break; // kanaal is leeg
+  }
+
+  return { deletedTotal, hitOldMessages };
+}
+
+function canManageMessages(channel) {
+  const me = channel.guild?.members?.me;
+  if (!me) return true; // buiten een guild (bv. DM) is er geen permissiecheck nodig
+  return channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageMessages) ?? false;
+}
+
 // Best-effort: stuurt een korte statusmelding naar de webhook (voor health-checks).
 // Faalt stil als het niet lukt (bv. bij een crash willen we niet nog een crash veroorzaken).
 async function sendStatusNotice(text) {
@@ -600,6 +637,17 @@ const slashCommands = [
     .setDescription("Bekijk waarschuwingen van een gebruiker (alleen moderators).")
     .addUserOption((option) =>
       option.setName("gebruiker").setDescription("De gebruiker om op te zoeken").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("wis")
+    .setDescription("Verwijdert berichten van iedereen (ook FantasieVeer) uit dit kanaal (alleen moderators).")
+    .addIntegerOption((option) =>
+      option
+        .setName("aantal")
+        .setDescription("Hoeveel berichten wissen (max 1000, standaard 50)")
+        .setMinValue(1)
+        .setMaxValue(1000)
+        .setRequired(false)
     ),
 ].map((cmd) => cmd.toJSON());
 
@@ -765,6 +813,45 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
+  if (trimmedContent === "!wis" || trimmedContent.startsWith("!wis ")) {
+    if (!isModerator(message.author.id)) {
+      try {
+        await sendAsVeer(message.channel, "✨ Alleen moderators mogen berichten wissen!");
+      } catch {}
+      return;
+    }
+    if (!canManageMessages(message.channel)) {
+      try {
+        await sendAsVeer(
+          message.channel,
+          "✨ Ik heb de 'Berichten beheren'-permissie nodig in dit kanaal om te kunnen wissen!"
+        );
+      } catch {}
+      return;
+    }
+    const parts = message.content.trim().split(/\s+/);
+    const requested = parseInt(parts[1], 10);
+    const amount = Number.isFinite(requested) && requested > 0 ? requested : 50;
+    try {
+      const { deletedTotal, hitOldMessages } = await purgeChannel(message.channel, amount);
+      const note = hitOldMessages
+        ? " (berichten ouder dan 14 dagen kan Discord niet in bulk wissen, die moeten handmatig)"
+        : "";
+      const confirmMsg = await message.channel.send(`🧹 ${deletedTotal} bericht(en) gewist${note}.`);
+      setTimeout(() => confirmMsg.delete().catch(() => {}), 5000);
+      console.log(`🧹 ${deletedTotal} berichten gewist in ${message.channelId} door ${message.author.username}.`);
+    } catch (err) {
+      console.error("❌ Fout bij het wissen van berichten:", err.message);
+      try {
+        const errMsg = await message.channel.send(
+          "✨ Er ging iets mis bij het wissen, misschien mis ik rechten of zijn de berichten te oud."
+        );
+        setTimeout(() => errMsg.delete().catch(() => {}), 5000);
+      } catch {}
+    }
+    return;
+  }
+
   // ----- Woordfilter: extra laag naast de AI-detectie -----
   if (containsBannedWord(message.content)) {
     console.log(`🚫 Verboden woord gedetecteerd van ${message.author.username} in ${message.channelId}.`);
@@ -916,6 +1003,36 @@ client.on("interactionCreate", async (interaction) => {
       }
       const targetUser = interaction.options.getUser("gebruiker", true);
       await interaction.reply({ content: buildWarningsMessage(targetUser), ephemeral: true });
+      return;
+    }
+
+    if (commandName === "wis") {
+      if (!isModerator(interaction.user.id)) {
+        await interaction.reply({ content: "✨ Alleen moderators mogen berichten wissen!", ephemeral: true });
+        return;
+      }
+      if (!canManageMessages(interaction.channel)) {
+        await interaction.reply({
+          content: "✨ Ik heb de 'Berichten beheren'-permissie nodig in dit kanaal om te kunnen wissen!",
+          ephemeral: true,
+        });
+        return;
+      }
+      const amount = interaction.options.getInteger("aantal") || 50;
+      await interaction.deferReply({ ephemeral: true });
+      try {
+        const { deletedTotal, hitOldMessages } = await purgeChannel(interaction.channel, amount);
+        const note = hitOldMessages
+          ? " (berichten ouder dan 14 dagen kan Discord niet in bulk wissen, die moeten handmatig)"
+          : "";
+        await interaction.editReply({ content: `🧹 ${deletedTotal} bericht(en) gewist${note}.` });
+        console.log(`🧹 ${deletedTotal} berichten gewist in ${interaction.channelId} door ${interaction.user.username} (via slash-command).`);
+      } catch (err) {
+        console.error("❌ Fout bij het wissen van berichten (slash-command):", err.message);
+        await interaction.editReply({
+          content: "✨ Er ging iets mis bij het wissen, misschien mis ik rechten of zijn de berichten te oud.",
+        });
+      }
       return;
     }
   } catch (err) {
