@@ -979,22 +979,68 @@ function buildStatusEmbed() {
   };
 }
 
+const STATUS_EMBED_TITLE = "🪶 FantasieVeer — livestatus";
+
+// Slaat statusMessageId meteen op (niet pas na 3s), zodat we 'm niet kwijtraken
+// bij een snelle herstart vlak na het aanmaken van een nieuw statusbericht.
+async function saveStatusMessageId(id) {
+  statusMessageId = id;
+  stateDirty = true;
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  await saveState();
+}
+
+// Zoekt of er al een eigen statusbericht in het kanaal staat (los van wat er in
+// state.json staat) en ruimt eventuele dubbele statusberichten meteen op. Dit
+// herstelt de situatie vanzelf als het opgeslagen ID kwijt was (bijv. door een
+// niet-persistente filesystem, een crash, of tijdelijk geen leesrechten).
+async function findAndCleanStatusMessages(channel) {
+  try {
+    const recent = await channel.messages.fetch({ limit: 25 });
+    const own = [...recent.values()]
+      .filter((m) => m.author.id === client.user.id && m.embeds[0]?.title === STATUS_EMBED_TITLE)
+      .sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+
+    const [newest, ...duplicates] = own;
+    for (const dup of duplicates) {
+      await dup.delete().catch(() => {});
+    }
+    if (duplicates.length) {
+      console.log(`🧹 ${duplicates.length} dubbel(e) statusbericht(en) opgeruimd in het statuskanaal.`);
+    }
+    return newest || null;
+  } catch (err) {
+    console.warn("⚠️ Kon bestaande statusberichten niet doorzoeken:", err.message);
+    return null;
+  }
+}
+
 async function updateStatusEmbed() {
   const channel = await fetchChannelSafe(STATUS_CHANNEL_ID_RESOLVED);
   if (!channel) return;
-  const embed = buildStatusEmbed();
+  const embed = { ...buildStatusEmbed(), title: STATUS_EMBED_TITLE };
 
   try {
+    let target = null;
+
     if (statusMessageId) {
-      const existing = await channel.messages.fetch(statusMessageId).catch(() => null);
-      if (existing) {
-        await existing.edit({ embeds: [embed] });
-        return;
-      }
+      target = await channel.messages.fetch(statusMessageId).catch(() => null);
     }
+    if (!target) {
+      target = await findAndCleanStatusMessages(channel);
+    }
+
+    if (target) {
+      await target.edit({ embeds: [embed] });
+      if (statusMessageId !== target.id) await saveStatusMessageId(target.id);
+      return;
+    }
+
     const sent = await channel.send({ embeds: [embed] });
-    statusMessageId = sent.id;
-    scheduleSave();
+    await saveStatusMessageId(sent.id);
   } catch (err) {
     console.warn("⚠️ Kon statuskanaal niet bijwerken:", err.message);
   }
