@@ -905,7 +905,7 @@ function buildConfigMessage() {
     `• Suggestiekanaal: <#${SUGGESTION_CHANNEL_ID_RESOLVED}>`,
     `• Verjaardagskanaal: ${getBirthdayChannelId() ? `<#${getBirthdayChannelId()}>` : "niet ingesteld"}`,
     `• Onderhoudsmodus: ${maintenanceMode ? "🔧 aan" : "uit"} (auto bij ${AUTO_MAINTENANCE_THRESHOLD} AI-fouten op rij, nu: ${consecutiveGroqFailures})`,
-    `• Actieve reactierol-berichten: ${reactionRolesMap.size}`,
+    `• Actieve reactierol-berichten: ${REACTION_ROLES_ENABLED ? reactionRolesMap.size : "uitgeschakeld (ENABLE_REACTION_ROLES=false)"}`,
     `• Geplande aankondigingen: ${scheduledAnnouncements.length}`,
     `• Veer van de Week: ${veerVanDeWeek ? veerVanDeWeek.name : "niet aangewezen"}`,
     "",
@@ -915,14 +915,24 @@ function buildConfigMessage() {
 }
 
 // ---------- Discord bot ----------
+// Reactierollen vereisen het privileged "Server Members Intent" (moet apart
+// aangezet worden in het Discord Developer Portal). Staat dit UIT terwijl de
+// bot toch om dit intent vraagt, weigert Discord de bot volledig in te loggen
+// — dan werkt he-le-maal niets meer. Daarom is dit standaard UIT; pas aan met
+// ENABLE_REACTION_ROLES=true in .env zodra je het intent hebt aangezet.
+const REACTION_ROLES_ENABLED = /^(1|true|yes)$/i.test(process.env.ENABLE_REACTION_ROLES || "");
+
+const clientIntents = [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.MessageContent,
+];
+if (REACTION_ROLES_ENABLED) {
+  clientIntents.push(GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.GuildMembers);
+}
+
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMessageReactions,
-    GatewayIntentBits.GuildMembers, // let op: privileged intent, aanzetten in het Discord Developer Portal
-  ],
+  intents: clientIntents,
   partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User],
 });
 
@@ -1691,6 +1701,15 @@ client.on("messageCreate", async (message) => {
   }
 
   if (trimmedContent.startsWith("!reactierol")) {
+    if (!REACTION_ROLES_ENABLED) {
+      try {
+        await sendAsVeer(
+          message.channel,
+          "✨ Reactierollen staan uit. Zet `ENABLE_REACTION_ROLES=true` in `.env` én 'Server Members Intent' aan in het Discord Developer Portal, en herstart de bot."
+        );
+      } catch {}
+      return;
+    }
     if (!isModerator(message.author.id)) {
       try {
         await sendAsVeer(message.channel, "✨ Alleen moderators mogen reactierol-berichten aanmaken!");
@@ -2679,5 +2698,18 @@ process.on("unhandledRejection", async (reason) => {
 // ---------- Opstarten ----------
 (async () => {
   await loadState();
-  await client.login(DISCORD_BOT_TOKEN);
+  try {
+    await client.login(DISCORD_BOT_TOKEN);
+  } catch (err) {
+    console.error("❌ Inloggen bij Discord is mislukt:", err.message);
+    if (/disallowed intents/i.test(err.message || "")) {
+      console.error(
+        "👉 Dit komt door een privileged intent die niet is aangezet. Ga naar het Discord Developer Portal → jouw applicatie → Bot, " +
+          "en zet 'Server Members Intent' aan (of zet ENABLE_REACTION_ROLES=false in .env als je reactierollen niet gebruikt)."
+      );
+    } else if (/token/i.test(err.message || "")) {
+      console.error("👉 Controleer of DISCORD_BOT_TOKEN in .env klopt en niet verlopen/gereset is.");
+    }
+    process.exit(1);
+  }
 })();
