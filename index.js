@@ -8,6 +8,7 @@ import {
   Routes,
   SlashCommandBuilder,
   PermissionFlagsBits,
+  ChannelType,
 } from "discord.js";
 import { readFile, writeFile, mkdir } from "fs/promises";
 import path from "path";
@@ -55,6 +56,14 @@ const {
   GROQ_AUTO_MAINTENANCE_THRESHOLD,
   STARTUP_NOTICE,
   DEBUG,
+  // Tijdelijke voice-kanalen
+  VOICE_CREATE_CHANNEL_ID, // het "➕ Kanaal maken"-voicekanaal; joinen hierin maakt een eigen kanaal aan
+  VOICE_CATEGORY_ID, // categorie waarin nieuwe tijdelijke kanalen worden aangemaakt (standaard: zelfde als het create-kanaal)
+  VOICE_PANEL_CHANNEL_ID, // kanaal met het bedieningspaneel/uitleg voor tijdelijke voice-kanalen
+  // Verjaardagsrol
+  BIRTHDAY_ROLE_ID, // rol die iemand op zijn/haar verjaardag tijdelijk krijgt ("Jarige")
+  // Sentiment-tracking (alleen zware signalen, puur ter info voor mods)
+  SENTIMENT_ALERT_COOLDOWN_MS,
 } = process.env;
 
 function fail(msg) {
@@ -117,6 +126,13 @@ const STATUS_INTERVAL = parseInt(STATUS_UPDATE_INTERVAL_MS || "60000", 10); // 1
 // Kostenteller: prijs per 1.000.000 tokens (optioneel, alleen voor een schatting).
 const PRICE_INPUT_PER_1M = parseFloat(GROQ_PRICE_PER_1M_INPUT || "0") || 0;
 const PRICE_OUTPUT_PER_1M = parseFloat(GROQ_PRICE_PER_1M_OUTPUT || "0") || 0;
+
+// ---------- Tijdelijke voice-kanalen ----------
+// Standaard paneel-kanaal-ID zoals aangeleverd, aan te passen via VOICE_PANEL_CHANNEL_ID.
+const VOICE_PANEL_CHANNEL_ID_RESOLVED = VOICE_PANEL_CHANNEL_ID || "1533251665430446241";
+
+// ---------- Sentiment-tracking ----------
+const SENTIMENT_COOLDOWN = parseInt(SENTIMENT_ALERT_COOLDOWN_MS || "900000", 10); // 15 minuten per kanaal
 
 // ============================================================
 //  SLIMMER WOORDFILTER
@@ -406,6 +422,14 @@ Jouw personage (speel dit heel concreet uit, dit is wie je bent — niet alleen 
 - Je mag alleen over FantasieCraft praten, niet over andere servers of games. Als iemand erover begint, zeg je vriendelijk dat je alleen FantasieCraft kent en dat ze het beste op de website van die andere server kunnen kijken.
 - Als iemand scheldt of grof is: zeg vriendelijk maar duidelijk dat we dat hier niet tolereren, en zet EXACT dit blokje aan het einde van je bericht: [TAG_MAKER] (dit wordt automatisch door het systeem vervangen door een echte tag van het moderatie-team — typ dit blokje zelf niet uit met andere tekst eromheen).
 - Praat in de taal terug die naar je word gesproken (Maakt niet uit welke taal!). Je theatrale karakter en uitdrukkingen mag je vertalen naar die taal, zolang de persoonlijkheid hetzelfde blijft.
+
+Denk- en antwoordkwaliteit (belangrijk, dit maakt je een betere assistent):
+- Lees het bericht eerst rustig door voordat je reageert: wat wordt er ECHT gevraagd, en wat is de kortste, meest behulpzame manier om dat te beantwoorden? Geef geen antwoord op een vraag die niet gesteld is.
+- Bij een feitelijke vraag waarvan het antwoord letterlijk hierboven in je instructies staat (over FantasieCraft, het team, solliciteren, bouwen, enz.): wees precies en consistent, verzin niets extra's en wijk niet af van de exacte namen/links die je hierboven hebt gekregen.
+- Bij een vage of dubbelzinnige vraag: kies de meest waarschijnlijke interpretatie en beantwoord die kort, in plaats van alleen een wedervraag terug te stellen. Een korte verduidelijkende wedervraag mag, maar nooit als enige inhoud van je bericht.
+- Bij meerdere sub-vragen in één bericht: probeer ze allebei kort te behandelen in plaats van er maar één te beantwoorden.
+- Wees consistent binnen hetzelfde gesprek: als je een paar berichten terug al iets hebt gezegd (bijvoorbeeld een naam of feit), spreek jezelf niet tegen zonder duidelijke reden.
+- Als iemand je vraagt om iets samen te vatten (bijvoorbeeld eerdere chatberichten die je krijgt aangeleverd), doe dat neutraal en kort in bulletpoints, zonder je theatrale persona te overdrijven — duidelijkheid gaat dan voor.
 `.trim();
 
 // ---------- Persistente state ----------
@@ -449,8 +473,33 @@ let consecutiveGroqFailures = 0;
 const guessGames = new Map(); // channelId -> { target, max }
 
 // Per-feature aan/uit-schakelaars.
-const DEFAULT_TOGGLES = { woordfilter: true, spam: true, faq: true, triggerimages: true, ai: true };
+const DEFAULT_TOGGLES = {
+  woordfilter: true,
+  spam: true,
+  faq: true,
+  triggerimages: true,
+  ai: true,
+  afk: true,
+  sentiment: true,
+  tempvoice: true,
+};
 let featureToggles = { ...DEFAULT_TOGGLES };
+
+// ---------- AFK-status ----------
+// userId -> { reason, since }
+const afkMap = new Map();
+
+// ---------- Tijdelijke voice-kanalen ----------
+// channelId -> { ownerId, isPrivate, createdAt }
+const tempVoiceChannels = new Map();
+
+// ---------- Sentiment-tracking (runtime, niet persistent) ----------
+// channelId -> laatste keer dat een alert naar het modkanaal is gestuurd
+const sentimentAlertCooldowns = new Map();
+
+// ---------- Webhook-watchdog ----------
+let webhookBroken = false;
+let webhookBrokenNoticeSentAt = 0;
 
 function isFeatureOn(name) {
   return featureToggles[name] !== false;
@@ -527,6 +576,9 @@ async function loadState() {
       scheduledAnnouncements = parsed.scheduledAnnouncements;
     }
     if (parsed.veerVanDeWeek) veerVanDeWeek = parsed.veerVanDeWeek;
+    for (const [userId, entry] of Object.entries(parsed.afk || {})) {
+      afkMap.set(userId, entry);
+    }
     ensureStatsForToday();
     console.log(
       `🧠 State geladen uit ${STATE_PATH} (${channelHistories.size} kanalen, ${warningsMap.size} gebruikers met waarschuwingen, ${birthdaysMap.size} verjaardagen)`
@@ -559,6 +611,7 @@ async function saveState() {
       ),
       scheduledAnnouncements,
       veerVanDeWeek,
+      afk: Object.fromEntries(afkMap.entries()),
     };
     await writeFile(STATE_PATH, JSON.stringify(obj), "utf8");
     stateDirty = false;
@@ -653,6 +706,51 @@ function progressLabel(countInWindow) {
   return `waarschuwing ${Math.min(countInWindow, ESCALATION_LIMIT)}/${ESCALATION_LIMIT}`;
 }
 
+// ---------- Sentiment-tracking (alleen bij écht heftige signalen) ----------
+// Dit is GEEN publieke actie: de bot reageert niet zichtbaar en plakt geen label
+// op iemand. Het stuurt uitsluitend een stille, korte melding naar het modkanaal
+// zodat een mens het kan beoordelen — nooit een diagnose, nooit automatisch ingrijpen.
+const DEFAULT_SEVERE_PATTERNS = [
+  /ik wil (niet meer|er niet meer zijn|dood)/i,
+  /ik ga (mezelf iets aandoen|zelfmoord plegen)/i,
+  /geen zin meer om te leven/i,
+  /ik maak (een einde aan|er een einde aan)/i,
+  /ik ga.*(vermoorden|neersteken|doodschieten)/i,
+  /ik haat mezelf zo erg/i,
+];
+
+const SENTIMENT_SEVERE_KEYWORDS_RAW = process.env.SENTIMENT_SEVERE_KEYWORDS || "";
+const extraSeverePatterns = SENTIMENT_SEVERE_KEYWORDS_RAW.split(",")
+  .map((w) => w.trim())
+  .filter(Boolean)
+  .map((phrase) => new RegExp(escapeRegExp(phrase.toLowerCase()), "i"));
+
+const SEVERE_PATTERNS = [...DEFAULT_SEVERE_PATTERNS, ...extraSeverePatterns];
+
+function detectSevereSentiment(text) {
+  const normalized = text.toLowerCase();
+  return SEVERE_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+async function maybeFlagSevereSentiment(message) {
+  if (!isFeatureOn("sentiment")) return;
+  if (!detectSevereSentiment(message.content)) return;
+
+  const lastAlert = sentimentAlertCooldowns.get(message.channelId) || 0;
+  if (Date.now() - lastAlert < SENTIMENT_COOLDOWN) return; // voorkomt spam-alerts uit hetzelfde gesprek
+  sentimentAlertCooldowns.set(message.channelId, Date.now());
+
+  await logToModChannel("", {
+    title: "🕊️ Mogelijk zwaar bericht opgemerkt",
+    description:
+      `Een bericht van **${message.author.username}** (<@${message.author.id}>) in <#${message.channelId}> bevat taal die kan wijzen op serieuze nood.\n\n` +
+      `Dit is puur een signaal ter beoordeling door een mens — er is geen automatische actie ondernomen en de gebruiker heeft hier niets van gemerkt.\n\n` +
+      `**Bericht:** ${message.content.slice(0, 500)}`,
+    color: 0x5865f2,
+    timestamp: new Date().toISOString(),
+  }).catch(() => {});
+}
+
 // ---------- Anti-spam voor de AI-quota: cooldown per gebruiker ----------
 const lastMessageAtMap = new Map();
 
@@ -710,8 +808,10 @@ async function callGroq(model, messages, { timeoutMs = 20000 } = {}) {
       body: JSON.stringify({
         model,
         messages,
-        temperature: 0.9,
-        max_tokens: 250,
+        temperature: 0.75,
+        max_tokens: 320,
+        presence_penalty: 0.3,
+        frequency_penalty: 0.2,
       }),
       signal: controller.signal,
     });
@@ -790,6 +890,22 @@ async function askFantasieVeer(channelId, username, userMessage) {
   return { reply, curseFlagged };
 }
 
+// ---------- Generieke, persona-loze AI-aanroep (voor bv. !samenvat) ----------
+async function askGroqRaw(systemPrompt, userPrompt, { maxTokens = 400 } = {}) {
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userPrompt },
+  ];
+  const data = await callGroqWithRetries(messages);
+  if (data?.usage) {
+    bumpTokenStats(data.usage.prompt_tokens, data.usage.completion_tokens);
+  }
+  return (
+    data?.choices?.[0]?.message?.content?.trim() ||
+    "✨ Ik kon daar even geen antwoord op verzinnen, probeer het nog eens!"
+  );
+}
+
 // ---------- Berichten opsplitsen (Discord-limiet is 2000 tekens) ----------
 function splitMessage(content, maxLen = 1900) {
   if (!content) return [""];
@@ -826,6 +942,10 @@ function buildHelpMessage() {
 • \`!changelog\` — wat is er onlangs toegevoegd?
 • \`!suggestie <tekst>\` — stuur een suggestie naar het team
 • \`/verjaardag [datum] [naam]\` — sla je verjaardag op (bijv. \`24-12\`), ik felicteer je dan automatisch
+• \`/verjaardagen\` — bekijk aankomende verjaardagen deze maand
+• \`/afk [reden]\` — zet jezelf op AFK, ik meld het automatisch als iemand je tagt
+• \`/samenvat [aantal]\` — vat de laatste berichten in dit kanaal samen
+• \`/call @gebruiker\` — nodig iemand uit in jouw tijdelijke voice-kanaal
 • \`!poll "vraag" optie1 | optie2\` — start een mini-poll (werkt in elk kanaal)
 • \`!raadmijn\` / \`!raadmijn stop\` — een klein raadspelletje
 • \`!veervandeweek [@gebruiker] [reden]\` — bekijk of wijs de Veer van de Week aan
@@ -836,6 +956,7 @@ function buildHelpMessage() {
 • \`!wis [aantal]\` — verwijdert berichten uit dit kanaal (alleen moderators)
 • \`!reactierol "titel" 🔴 @Rol\` — reactierol-bericht aanmaken, werkt in elk kanaal (alleen moderators)
 • \`!aankondig "tekst" op 20:00\` — plan een aankondiging in, werkt in elk kanaal (alleen moderators)
+• \`/embed\` — bouw snel een nette embed (alleen moderators)
 • \`!startupdate [reden]\` — zet onderhoudsmodus aan (alleen moderators)
 • \`!stopupdate\` — zet onderhoudsmodus weer uit (alleen moderators)
 • \`!toggle <functie> <aan/uit>\` — zet een functie aan/uit (alleen moderators)
@@ -904,6 +1025,12 @@ function buildConfigMessage() {
     `• Statuskanaal: <#${STATUS_CHANNEL_ID_RESOLVED}>`,
     `• Suggestiekanaal: <#${SUGGESTION_CHANNEL_ID_RESOLVED}>`,
     `• Verjaardagskanaal: ${getBirthdayChannelId() ? `<#${getBirthdayChannelId()}>` : "niet ingesteld"}`,
+    `• Jarige-rol: ${BIRTHDAY_ROLE_ID ? `<@&${BIRTHDAY_ROLE_ID}>` : "niet ingesteld"}`,
+    `• Voice-aanmaakkanaal: ${VOICE_CREATE_CHANNEL_ID ? `<#${VOICE_CREATE_CHANNEL_ID}>` : "niet ingesteld"}`,
+    `• Voice-paneelkanaal: <#${VOICE_PANEL_CHANNEL_ID_RESOLVED}>`,
+    `• Actieve tijdelijke voice-kanalen: ${tempVoiceChannels.size}`,
+    `• Actieve AFK-statussen: ${afkMap.size}`,
+    `• Webhook-status: ${webhookBroken ? "🔴 werkt niet (zie logs)" : "🟢 werkt"}`,
     `• Onderhoudsmodus: ${maintenanceMode ? "🔧 aan" : "uit"} (auto bij ${AUTO_MAINTENANCE_THRESHOLD} AI-fouten op rij, nu: ${consecutiveGroqFailures})`,
     `• Actieve reactierol-berichten: ${REACTION_ROLES_ENABLED ? reactionRolesMap.size : "uitgeschakeld (ENABLE_REACTION_ROLES=false)"}`,
     `• Geplande aankondigingen: ${scheduledAnnouncements.length}`,
@@ -926,6 +1053,7 @@ const clientIntents = [
   GatewayIntentBits.Guilds,
   GatewayIntentBits.GuildMessages,
   GatewayIntentBits.MessageContent,
+  GatewayIntentBits.GuildVoiceStates,
 ];
 if (REACTION_ROLES_ENABLED) {
   clientIntents.push(GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.GuildMembers);
@@ -990,6 +1118,46 @@ async function sendWarningDm(discordUser, reasonText, countInWindow) {
   } catch (err) {
     debugLog(`Kon geen DM sturen naar ${discordUser.id} (waarschijnlijk DM's dicht):`, err.message);
   }
+}
+
+// ---------- AFK-status (werkt in elk kanaal) ----------
+function setAfk(userId, reason) {
+  afkMap.set(userId, { reason: reason || "geen reden opgegeven", since: Date.now() });
+  scheduleSave();
+}
+
+function clearAfk(userId) {
+  const existed = afkMap.delete(userId);
+  if (existed) scheduleSave();
+  return existed;
+}
+
+function getAfk(userId) {
+  return afkMap.get(userId) || null;
+}
+
+function afkDurationLabel(since) {
+  const minutes = Math.max(1, Math.round((Date.now() - since) / 60000));
+  if (minutes < 60) return `${minutes} minuut/minuten`;
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  return `${hours}u ${restMinutes}m`;
+}
+
+// Verzamelt AFK-meldingen voor alle @mentions in een bericht (max een paar, om
+// spam bij een mega-mention-bericht te voorkomen), en logt niets naar het modkanaal.
+function buildAfkMentionNotices(message) {
+  const notices = [];
+  for (const [, mentionedUser] of message.mentions.users) {
+    if (mentionedUser.id === message.author.id) continue;
+    const afk = getAfk(mentionedUser.id);
+    if (!afk) continue;
+    notices.push(
+      `💤 **${mentionedUser.username}** is momenteel AFK (${afkDurationLabel(afk.since)}): _${afk.reason}_`
+    );
+    if (notices.length >= 3) break;
+  }
+  return notices;
 }
 
 // ---------- Mini-polls (werkt in elk kanaal) ----------
@@ -1215,10 +1383,79 @@ async function checkBirthdays() {
       }
       info.lastAnnouncedYear = year;
       changed = true;
+      await grantBirthdayRole(channel, userId);
     }
   }
 
   if (changed) scheduleSave();
+
+  // Rol weer intrekken bij iedereen die 'm nog heeft maar niet meer jarig is vandaag.
+  await revokeStaleBirthdayRoles(channelId, day, month);
+}
+
+// ---------- Tijdelijke "Jarige"-rol ----------
+async function grantBirthdayRole(fallbackChannel, userId) {
+  if (!BIRTHDAY_ROLE_ID) return;
+  try {
+    const channel = fallbackChannel || (await fetchChannelSafe(getBirthdayChannelId()));
+    const guild = channel?.guild;
+    if (!guild) return;
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (!member) return;
+    if (!member.roles.cache.has(BIRTHDAY_ROLE_ID)) {
+      await member.roles.add(BIRTHDAY_ROLE_ID).catch((err) => {
+        console.warn(`⚠️ Kon Jarige-rol niet toekennen aan ${userId}:`, err.message);
+      });
+    }
+  } catch (err) {
+    console.warn("⚠️ Fout bij het toekennen van de Jarige-rol:", err.message);
+  }
+}
+
+async function revokeStaleBirthdayRoles(channelId, todayDay, todayMonth) {
+  if (!BIRTHDAY_ROLE_ID) return;
+  try {
+    const channel = await fetchChannelSafe(channelId);
+    const guild = channel?.guild;
+    if (!guild) return;
+    const role = await guild.roles.fetch(BIRTHDAY_ROLE_ID).catch(() => null);
+    if (!role) return;
+
+    for (const [memberId, member] of role.members) {
+      const info = birthdaysMap.get(memberId);
+      const stillBirthday = info && info.day === todayDay && info.month === todayMonth;
+      if (!stillBirthday) {
+        await member.roles.remove(BIRTHDAY_ROLE_ID).catch((err) => {
+          console.warn(`⚠️ Kon Jarige-rol niet intrekken bij ${memberId}:`, err.message);
+        });
+      }
+    }
+  } catch (err) {
+    console.warn("⚠️ Fout bij het intrekken van verlopen Jarige-rollen:", err.message);
+  }
+}
+
+// ---------- /verjaardagen: overzicht aankomende verjaardagen deze maand ----------
+function buildUpcomingBirthdaysMessage() {
+  const now = new Date();
+  const currentMonth = now.getMonth() + 1;
+  const currentDay = now.getDate();
+
+  const thisMonth = [...birthdaysMap.entries()]
+    .filter(([, info]) => info.month === currentMonth)
+    .sort((a, b) => a[1].day - b[1].day);
+
+  if (!thisMonth.length) {
+    return "🪶 Niemand heeft deze maand een verjaardag bij mij opgeslagen. Gebruik `/verjaardag` om die van jou toe te voegen!";
+  }
+
+  const lines = thisMonth.map(([userId, info]) => {
+    const dateLabel = `${String(info.day).padStart(2, "0")}-${String(info.month).padStart(2, "0")}`;
+    const marker = info.day === currentDay ? " 🎉 (vandaag!)" : info.day < currentDay ? " (geweest)" : "";
+    return `• ${dateLabel} — <@${userId}> (${info.name})${marker}`;
+  });
+
+  return ["🎂 **Verjaardagen deze maand:**", ...lines].join("\n");
 }
 
 // ---------- Veer van de Week ----------
@@ -1259,6 +1496,92 @@ async function maybeLogUnknownAnswer(channelId, question, reply, askedBy) {
     footer: { text: `Kanaal: ${channelId}` },
     timestamp: new Date().toISOString(),
   });
+}
+
+// ---------- /embed: simpele embed-bouwer (alleen moderators) ----------
+const HEX_COLOR_PATTERN = /^#?[0-9a-f]{6}$/i;
+const DEFAULT_EMBED_COLOR = 0xeb459e;
+
+function parseHexColor(raw) {
+  if (!raw) return DEFAULT_EMBED_COLOR;
+  const cleaned = raw.trim();
+  if (!HEX_COLOR_PATTERN.test(cleaned)) return null;
+  return parseInt(cleaned.replace("#", ""), 16);
+}
+
+function isLikelyUrl(raw) {
+  if (!raw) return true; // optioneel veld, leeg is toegestaan
+  try {
+    const url = new URL(raw);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function buildCustomEmbed({ title, description, colorHex, imageUrl, thumbnailUrl, footer, author }) {
+  const color = parseHexColor(colorHex);
+  const embed = {
+    title: title.slice(0, 256),
+    description: description.slice(0, 4000),
+    color: color === null ? DEFAULT_EMBED_COLOR : color,
+    timestamp: new Date().toISOString(),
+  };
+  if (imageUrl) embed.image = { url: imageUrl };
+  if (thumbnailUrl) embed.thumbnail = { url: thumbnailUrl };
+  if (footer) embed.footer = { text: footer.slice(0, 200) };
+  if (author) embed.footer = { text: `${embed.footer ? embed.footer.text + " • " : ""}Via ${author}` };
+  return embed;
+}
+
+// Verwacht: !embed "titel" | "beschrijving" | #kleur | afbeelding-url | footer
+// De laatste 3 delen zijn optioneel.
+function parseEmbedCommand(rawContent) {
+  const withoutCommand = rawContent.trim().replace(/^!embed\s*/i, "");
+  const parts = withoutCommand.split("|").map((p) => p.trim());
+  const titleMatch = (parts[0] || "").match(/^"([^"]+)"$/);
+  const descMatch = (parts[1] || "").match(/^"([^"]+)"$/);
+  if (!titleMatch || !descMatch) return null;
+  return {
+    title: titleMatch[1],
+    description: descMatch[1],
+    colorHex: parts[2] || null,
+    imageUrl: parts[3] || null,
+    footer: parts[4] || null,
+  };
+}
+
+// ---------- /samenvat: laat de AI de laatste berichten in het kanaal samenvatten ----------
+const SUMMARY_SYSTEM_PROMPT = `
+Je bent een neutrale samenvatter voor een Discord-kanaal van de server FantasieCraft.
+Vat het onderstaande gesprek kort en helder samen in het Nederlands, in maximaal 6 bulletpoints.
+Focus op de belangrijkste onderwerpen, beslissingen en vragen — niet op elk losse bericht.
+Noem gebruikersnamen alleen als dat relevant is voor de context. Geen persoonlijke meningen toevoegen,
+geen theatrale toon, gewoon een zakelijke, duidelijke samenvatting. Als het gesprek te weinig inhoud
+heeft om samen te vatten, zeg dat dan gewoon kort.
+`.trim();
+
+async function buildChannelSummary(channel, amount) {
+  const fetched = await channel.messages.fetch({ limit: Math.min(Math.max(amount, 5), 100) });
+  const ordered = [...fetched.values()]
+    .filter((m) => m.content && m.content.trim() && !m.content.startsWith("!") && !m.content.startsWith("/"))
+    .reverse();
+
+  if (!ordered.length) {
+    return "🪶 Ik vond niet genoeg tekstberichten in dit kanaal om samen te vatten.";
+  }
+
+  const transcript = ordered
+    .slice(-80) // hard begrensen om de prompt niet te groot te maken
+    .map((m) => `${m.author.username}: ${m.content.slice(0, 500)}`)
+    .join("\n");
+
+  const summary = await askGroqRaw(
+    SUMMARY_SYSTEM_PROMPT,
+    `Gesprek (${ordered.length} berichten):\n${transcript}`,
+    { maxTokens: 400 }
+  );
+  return `📝 **Samenvatting van de laatste ${ordered.length} berichten:**\n${summary}`;
 }
 
 // ---------- Live statuskanaal ----------
@@ -1356,6 +1679,159 @@ async function updateStatusEmbed() {
     console.warn("⚠️ Kon statuskanaal niet bijwerken:", err.message);
   }
 }
+
+// ---------- Tijdelijke voice-kanalen (privé by default, uitnodigen via /call) ----------
+const VOICE_PANEL_TITLE = "🔊 Tijdelijke voice-kanalen";
+
+function buildVoicePanelEmbed() {
+  return {
+    title: VOICE_PANEL_TITLE,
+    description: [
+      VOICE_CREATE_CHANNEL_ID
+        ? `Join <#${VOICE_CREATE_CHANNEL_ID}> en ik maak automatisch je eigen, privé voice-kanaal aan!`
+        : "Er is nog geen aanmaakkanaal ingesteld (VOICE_CREATE_CHANNEL_ID).",
+      "Jouw kanaal is standaard alleen voor jou zichtbaar en joinbaar.",
+      "Gebruik `/call @gebruiker` om iemand alsnog uit te nodigen in jouw kanaal.",
+      "Zodra iedereen het kanaal verlaat, ruim ik het automatisch weer op. ✨",
+    ].join("\n"),
+    color: 0x5865f2,
+    footer: { text: "FantasieVeer — tijdelijke voice-kanalen" },
+  };
+}
+
+async function ensureVoicePanel() {
+  const channel = await fetchChannelSafe(VOICE_PANEL_CHANNEL_ID_RESOLVED);
+  if (!channel) return;
+  try {
+    const recent = await channel.messages.fetch({ limit: 25 });
+    const existing = [...recent.values()].find(
+      (m) => m.author.id === client.user.id && m.embeds[0]?.title === VOICE_PANEL_TITLE
+    );
+    if (existing) return;
+    await channel.send({ embeds: [buildVoicePanelEmbed()] });
+  } catch (err) {
+    console.warn("⚠️ Kon het voice-infopaneel niet plaatsen:", err.message);
+  }
+}
+
+function sanitizeChannelNamePart(name) {
+  return name.replace(/[^\p{L}\p{N} _-]/gu, "").slice(0, 20).trim() || "speler";
+}
+
+async function createTempVoiceChannel(member, sourceChannel) {
+  const guild = member.guild;
+  const parentId = VOICE_CATEGORY_ID || sourceChannel.parentId || null;
+
+  const overwrites = [
+    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] },
+    {
+      id: member.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.Connect,
+        PermissionFlagsBits.Speak,
+        PermissionFlagsBits.ManageChannels,
+      ],
+    },
+  ];
+  if (guild.members.me) {
+    overwrites.push({
+      id: guild.members.me.id,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.ManageChannels],
+    });
+  }
+
+  const channel = await guild.channels.create({
+    name: `🔒 ${sanitizeChannelNamePart(member.user.username)}'s kanaal`,
+    type: ChannelType.GuildVoice,
+    parent: parentId || undefined,
+    permissionOverwrites: overwrites,
+  });
+
+  tempVoiceChannels.set(channel.id, { ownerId: member.id, isPrivate: true, createdAt: Date.now() });
+
+  try {
+    await member.voice.setChannel(channel.id);
+  } catch (err) {
+    console.warn(`⚠️ Kon ${member.user.username} niet direct verplaatsen naar het nieuwe voice-kanaal:`, err.message);
+  }
+
+  console.log(`🔊 Tijdelijk voice-kanaal aangemaakt voor ${member.user.username} (${channel.id}).`);
+  return channel;
+}
+
+async function maybeDeleteEmptyTempChannel(channel) {
+  if (!channel || !tempVoiceChannels.has(channel.id)) return;
+  if (channel.members.size > 0) return;
+  try {
+    await channel.delete("Tijdelijk voice-kanaal is leeg.");
+    console.log(`🧹 Leeg tijdelijk voice-kanaal opgeruimd (${channel.id}).`);
+  } catch (err) {
+    console.warn(`⚠️ Kon leeg tijdelijk voice-kanaal niet verwijderen (${channel.id}):`, err.message);
+  } finally {
+    tempVoiceChannels.delete(channel.id);
+  }
+}
+
+function findOwnedTempChannel(userId) {
+  for (const [channelId, info] of tempVoiceChannels.entries()) {
+    if (info.ownerId === userId) return channelId;
+  }
+  return null;
+}
+
+async function inviteUserToTempChannel(ownerId, targetUser, guild) {
+  const channelId = findOwnedTempChannel(ownerId);
+  if (!channelId) return { ok: false, reason: "no-channel" };
+  const channel = await fetchChannelSafe(channelId);
+  if (!channel) return { ok: false, reason: "no-channel" };
+
+  try {
+    await channel.permissionOverwrites.edit(targetUser.id, {
+      ViewChannel: true,
+      Connect: true,
+    });
+  } catch (err) {
+    console.warn(`⚠️ Kon ${targetUser.id} geen toegang geven tot voice-kanaal ${channelId}:`, err.message);
+    return { ok: false, reason: "permission-error" };
+  }
+
+  try {
+    await targetUser.send(
+      `🔔 Je bent uitgenodigd voor een privé voice-kanaal op FantasieCraft! Klik hier om te joinen: <#${channelId}>`
+    );
+  } catch {
+    debugLog(`Kon geen DM sturen naar ${targetUser.id} voor de call-uitnodiging.`);
+  }
+
+  return { ok: true, channelId };
+}
+
+client.on("voiceStateUpdate", async (oldState, newState) => {
+  if (!isFeatureOn("tempvoice")) return;
+  try {
+    // Iemand joint het aanmaakkanaal -> nieuw privé kanaal voor die persoon.
+    if (VOICE_CREATE_CHANNEL_ID && newState.channelId === VOICE_CREATE_CHANNEL_ID && newState.member) {
+      const alreadyOwned = findOwnedTempChannel(newState.member.id);
+      if (alreadyOwned) {
+        const existingChannel = await fetchChannelSafe(alreadyOwned);
+        if (existingChannel) {
+          await newState.member.voice.setChannel(alreadyOwned).catch(() => {});
+        }
+      } else {
+        await createTempVoiceChannel(newState.member, newState.channel);
+      }
+    }
+
+    // Iemand verlaat een tijdelijk kanaal -> checken of het leeg is geworden.
+    if (oldState.channelId && oldState.channelId !== newState.channelId && tempVoiceChannels.has(oldState.channelId)) {
+      const leftChannel = oldState.channel || (await fetchChannelSafe(oldState.channelId));
+      await maybeDeleteEmptyTempChannel(leftChannel);
+    }
+  } catch (err) {
+    console.error("❌ Fout bij het verwerken van een voice-statuswijziging:", err.message);
+  }
+});
 
 // ---------- Berichten wissen (!wis / /wis) ----------
 const MAX_WIPE_LIMIT = 1000;
@@ -1483,7 +1959,10 @@ const slashCommands = [
           { name: "Spamdetectie", value: "spam" },
           { name: "FAQ-herkenning", value: "faq" },
           { name: "Trefwoord-afbeeldingen", value: "triggerimages" },
-          { name: "AI-antwoorden", value: "ai" }
+          { name: "AI-antwoorden", value: "ai" },
+          { name: "AFK-status", value: "afk" },
+          { name: "Sentiment-tracking", value: "sentiment" },
+          { name: "Tijdelijke voice-kanalen", value: "tempvoice" }
         )
     )
     .addBooleanOption((option) => option.setName("aan").setDescription("Aan (true) of uit (false)").setRequired(true)),
@@ -1519,6 +1998,50 @@ const slashCommands = [
     .addStringOption((option) =>
       option.setName("tijd").setDescription("Tijdstip in 24-uursnotatie, bijv. 20:00").setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName("afk")
+    .setDescription("Zet jezelf op AFK — ik meld het automatisch als iemand je tagt.")
+    .addStringOption((option) =>
+      option.setName("reden").setDescription("Optionele reden").setRequired(false).setMaxLength(200)
+    ),
+  new SlashCommandBuilder()
+    .setName("verjaardagen")
+    .setDescription("Bekijk wie deze maand jarig is."),
+  new SlashCommandBuilder()
+    .setName("samenvat")
+    .setDescription("Vat de laatste berichten in dit kanaal samen.")
+    .addIntegerOption((option) =>
+      option
+        .setName("aantal")
+        .setDescription("Hoeveel berichten terugkijken (standaard 30, max 100)")
+        .setMinValue(5)
+        .setMaxValue(100)
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
+    .setName("call")
+    .setDescription("Nodig iemand uit in jouw tijdelijke voice-kanaal.")
+    .addUserOption((option) => option.setName("gebruiker").setDescription("Wie uitnodigen").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("embed")
+    .setDescription("Bouw snel een nette embed (alleen moderators).")
+    .addStringOption((option) => option.setName("titel").setDescription("Titel van de embed").setRequired(true))
+    .addStringOption((option) =>
+      option.setName("beschrijving").setDescription("Beschrijvingstekst").setRequired(true).setMaxLength(3800)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("kleur")
+        .setDescription("Hex-kleurcode, bijv. #57F287 (standaard: FantasieVeer-paars)")
+        .setRequired(false)
+    )
+    .addStringOption((option) =>
+      option.setName("afbeelding").setDescription("URL van een grote afbeelding onderin").setRequired(false)
+    )
+    .addStringOption((option) =>
+      option.setName("thumbnail").setDescription("URL van een kleine afbeelding rechtsboven").setRequired(false)
+    )
+    .addStringOption((option) => option.setName("footer").setDescription("Kleine tekst onderaan").setRequired(false)),
 ].map((cmd) => cmd.toJSON());
 
 async function registerSlashCommands() {
@@ -1653,6 +2176,9 @@ const TOGGLE_LABELS = {
   faq: "FAQ-herkenning",
   triggerimages: "Trefwoord-afbeeldingen",
   ai: "AI-antwoorden",
+  afk: "AFK-status",
+  sentiment: "Sentiment-tracking",
+  tempvoice: "Tijdelijke voice-kanalen",
 };
 
 client.on("messageCreate", async (message) => {
@@ -1772,6 +2298,125 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
+  if (trimmedContent === "!afk" || trimmedContent.startsWith("!afk ")) {
+    if (!isFeatureOn("afk")) return;
+    const reason = message.content.trim().slice("!afk".length).trim() || null;
+    setAfk(message.author.id, reason);
+    try {
+      await sendAsVeer(
+        message.channel,
+        `💤 <@${message.author.id}> is nu AFK${reason ? `: _${reason}_` : ""}. Ik meld het automatisch als iemand je tagt!`,
+        { mentionUsers: [message.author.id] }
+      );
+    } catch (err) {
+      console.error("❌ Fout bij het instellen van AFK:", err.message);
+    }
+    return;
+  }
+
+  if (isFeatureOn("afk")) {
+    // Iemand die zelf weer typt terwijl die AFK stond: AFK opheffen en welkom terug melden.
+    if (getAfk(message.author.id) && !trimmedContent.startsWith("!afk")) {
+      const afk = getAfk(message.author.id);
+      clearAfk(message.author.id);
+      try {
+        await sendAsVeer(
+          message.channel,
+          `👋 Welkom terug <@${message.author.id}>! Ik heb je AFK-status (was ${afkDurationLabel(afk.since)}) weer opgeheven. ✨`,
+          { mentionUsers: [message.author.id] }
+        );
+      } catch (err) {
+        console.error("❌ Fout bij het opheffen van AFK:", err.message);
+      }
+    }
+
+    // Iemand tagt een AFK-gebruiker: netjes melden, geen extra AI-call nodig.
+    if (message.mentions.users.size) {
+      const notices = buildAfkMentionNotices(message);
+      if (notices.length) {
+        try {
+          await message.channel.send(notices.join("\n"));
+        } catch (err) {
+          console.error("❌ Fout bij het versturen van de AFK-melding:", err.message);
+        }
+      }
+    }
+  }
+
+  if (trimmedContent.startsWith("!embed")) {
+    if (!isModerator(message.author.id)) {
+      try {
+        await sendAsVeer(message.channel, "✨ Alleen moderators mogen embeds bouwen!");
+      } catch {}
+      return;
+    }
+    const parsed = parseEmbedCommand(message.content);
+    if (!parsed) {
+      try {
+        await sendAsVeer(
+          message.channel,
+          '✨ Gebruik: `!embed "titel" | "beschrijving" | #kleur | afbeelding-url | footer` (kleur/afbeelding/footer optioneel).'
+        );
+      } catch {}
+      return;
+    }
+    if (parsed.colorHex && parseHexColor(parsed.colorHex) === null) {
+      try {
+        await sendAsVeer(message.channel, "✨ Die kleurcode snap ik niet — gebruik bijvoorbeeld `#57F287`.");
+      } catch {}
+      return;
+    }
+    if (!isLikelyUrl(parsed.imageUrl)) {
+      try {
+        await sendAsVeer(message.channel, "✨ De afbeelding-url ziet er niet geldig uit.");
+      } catch {}
+      return;
+    }
+    try {
+      const embed = buildCustomEmbed({ ...parsed, author: message.author.username });
+      await message.channel.send({ embeds: [embed] });
+      await logToModChannel(`🖼️ **${message.author.username}** bouwde een embed in <#${message.channelId}>.`);
+    } catch (err) {
+      console.error("❌ Fout bij het bouwen van de embed:", err.message);
+      try {
+        await sendAsVeer(message.channel, "✨ Dat lukte niet — controleer je invoer en probeer het nog eens.");
+      } catch {}
+    }
+    return;
+  }
+
+  if (trimmedContent === "!verjaardagen") {
+    try {
+      await sendAsVeer(message.channel, buildUpcomingBirthdaysMessage());
+    } catch (err) {
+      console.error("❌ Fout bij het versturen van de verjaardagenlijst:", err.message);
+    }
+    return;
+  }
+
+  if (trimmedContent === "!samenvat" || trimmedContent.startsWith("!samenvat ")) {
+    if (!isFeatureOn("ai")) {
+      try {
+        await sendAsVeer(message.channel, "✨ AI-antwoorden staan momenteel uit, dus samenvatten lukt even niet.");
+      } catch {}
+      return;
+    }
+    const parts = message.content.trim().split(/\s+/);
+    const requested = parseInt(parts[1], 10);
+    const amount = Number.isFinite(requested) && requested > 0 ? requested : 30;
+    try {
+      await message.channel.sendTyping().catch(() => {});
+      const summary = await buildChannelSummary(message.channel, amount);
+      await sendAsVeer(message.channel, summary);
+    } catch (err) {
+      console.error("❌ Fout bij het samenvatten van het kanaal:", err.message);
+      try {
+        await sendAsVeer(message.channel, "✨ Het samenvatten lukte nu niet, probeer het straks nog eens!");
+      } catch {}
+    }
+    return;
+  }
+
   if (TARGET_CHANNEL_IDS.length && !TARGET_CHANNEL_IDS.includes(message.channelId)) return;
 
   if (isMuted(message.author.id)) {
@@ -1781,6 +2426,9 @@ client.on("messageCreate", async (message) => {
   }
 
   console.log(`💬 ${message.author.username} in ${message.channelId}: "${message.content}"`);
+
+  // Stil op de achtergrond checken op écht heftige signalen, blokkeert niets anders.
+  maybeFlagSevereSentiment(message).catch(() => {});
 
   // ----- Vaste commando's -----
   if (trimmedContent === "!startupdate" || trimmedContent.startsWith("!startupdate ")) {
