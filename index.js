@@ -9,6 +9,9 @@ import {
   SlashCommandBuilder,
   PermissionFlagsBits,
   ChannelType,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } from "discord.js";
 import { readFile, writeFile, mkdir } from "fs/promises";
 import path from "path";
@@ -384,6 +387,7 @@ const CHANGELOG_ENTRIES = [
   "🆕 Geplande aankondigingen en 'vraag het team'-escalatie naar het modkanaal",
   "🆕 /afk met automatische melding bij tags, in elk kanaal",
   "🆕 Tijdelijke, privé voice-kanalen via /startcall (met onbeperkt aantal genodigden) of het aanmaakkanaal, plus /call",
+  "🆕 /callembed — stuurt het voice-infopaneel met een knop opnieuw, één klik = eigen voice-kanaal",
   "🆕 /embed — snel een nette embed bouwen (moderators)",
   "🆕 /samenvat — laat de AI een kanaal samenvatten",
   "🆕 Stille sentiment-tracking bij écht heftige berichten (alleen melding aan mods)",
@@ -958,6 +962,7 @@ function buildHelpMessage() {
 • \`!samenvat [aantal]\` / \`/samenvat [aantal]\` — vat de laatste berichten in dit kanaal samen, werkt in elk kanaal
 • \`/startcall [gebruikers]\` — maak (of hergebruik) je tijdelijke voice-kanaal en nodig meteen wie je wil uit, geen limiet
 • \`/call @gebruiker\` — nodig later nog iemand extra uit in jouw tijdelijke voice-kanaal
+• \`/callembed\` — stuur het infopaneel voor voice-kanalen (met knop) opnieuw in dit kanaal
 • \`!poll "vraag" optie1 | optie2\` — start een mini-poll (werkt in elk kanaal)
 • \`!raadmijn\` / \`!raadmijn stop\` — een klein raadspelletje
 • \`!veervandeweek [@gebruiker] [reden]\` — bekijk of wijs de Veer van de Week aan
@@ -1745,6 +1750,7 @@ async function updateStatusEmbed() {
 
 // ---------- Tijdelijke voice-kanalen (privé by default, uitnodigen via /call) ----------
 const VOICE_PANEL_TITLE = "🔊 Tijdelijke voice-kanalen";
+const VOICE_CREATE_BUTTON_ID = "temp_voice_create";
 
 function buildVoicePanelEmbed() {
   return {
@@ -1752,7 +1758,7 @@ function buildVoicePanelEmbed() {
     description: [
       VOICE_CREATE_CHANNEL_ID
         ? `Join <#${VOICE_CREATE_CHANNEL_ID}> en ik maak automatisch je eigen, privé voice-kanaal aan!`
-        : "Gebruik `/startcall` om direct je eigen, privé voice-kanaal aan te maken (en meteen mensen uit te nodigen).",
+        : "Klik hieronder op de knop, of gebruik `/startcall`, om direct je eigen, privé voice-kanaal aan te maken.",
       "Jouw kanaal is standaard alleen voor jou zichtbaar en joinbaar.",
       "Gebruik `/startcall @gebruiker1 @gebruiker2 ...` om er meteen mensen bij te tellen, of `/call @gebruiker` om er later nog iemand bij te vragen.",
       "Zodra iedereen het kanaal verlaat, ruim ik het automatisch weer op. ✨",
@@ -1760,6 +1766,16 @@ function buildVoicePanelEmbed() {
     color: 0x5865f2,
     footer: { text: "FantasieVeer — tijdelijke voice-kanalen" },
   };
+}
+
+function buildVoicePanelComponents() {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(VOICE_CREATE_BUTTON_ID)
+      .setLabel("🔊 Maak mijn voice-kanaal")
+      .setStyle(ButtonStyle.Primary)
+  );
+  return [row];
 }
 
 async function ensureVoicePanel() {
@@ -1770,8 +1786,14 @@ async function ensureVoicePanel() {
     const existing = [...recent.values()].find(
       (m) => m.author.id === client.user.id && m.embeds[0]?.title === VOICE_PANEL_TITLE
     );
-    if (existing) return;
-    await channel.send({ embeds: [buildVoicePanelEmbed()] });
+    if (existing) {
+      // Bestaand paneel bijwerken zodat de knop er ook op staat, ook na een update van de bot.
+      if (!existing.components?.length) {
+        await existing.edit({ embeds: [buildVoicePanelEmbed()], components: buildVoicePanelComponents() }).catch(() => {});
+      }
+      return;
+    }
+    await channel.send({ embeds: [buildVoicePanelEmbed()], components: buildVoicePanelComponents() });
   } catch (err) {
     console.warn("⚠️ Kon het voice-infopaneel niet plaatsen:", err.message);
   }
@@ -2096,6 +2118,9 @@ const slashCommands = [
         .setDescription("Tag de mensen die je wil uitnodigen, gescheiden door een spatie (optioneel, geen maximum)")
         .setRequired(false)
     ),
+  new SlashCommandBuilder()
+    .setName("callembed")
+    .setDescription("Stuur het infopaneel voor tijdelijke voice-kanalen (met knop) opnieuw in dit kanaal."),
   new SlashCommandBuilder()
     .setName("embed")
     .setDescription("Bouw snel een nette embed (alleen moderators).")
@@ -3074,6 +3099,53 @@ client.on("messageReactionRemove", (reaction, user) => {
 // ---------- Slash-commands afhandelen ----------
 client.on("interactionCreate", async (interaction) => {
 
+  if (interaction.isButton() && interaction.customId === VOICE_CREATE_BUTTON_ID) {
+    if (!isFeatureOn("tempvoice")) {
+      await interaction.reply({ content: "✨ Tijdelijke voice-kanalen staan momenteel uit.", ephemeral: true }).catch(() => {});
+      return;
+    }
+    if (maintenanceMode) {
+      await interaction
+        .reply({ content: "🔧 FantasieVeer is momenteel in onderhoudsmodus en reageert zo weer terug!", ephemeral: true })
+        .catch(() => {});
+      return;
+    }
+    try {
+      await interaction.deferReply({ ephemeral: true });
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+
+      let channelId = findOwnedTempChannel(interaction.user.id);
+      let channel = channelId ? await fetchChannelSafe(channelId) : null;
+
+      if (!channel) {
+        channel = await createTempVoiceChannel(member, member.voice.channel || null);
+        channelId = channel.id;
+      } else if (member.voice.channelId !== channelId) {
+        await member.voice.setChannel(channelId).catch(() => {});
+      }
+
+      const movedNote =
+        member.voice.channelId === channelId
+          ? ""
+          : " Ik kon je niet automatisch verplaatsen omdat je nog nergens in voice zat — join 'm zelf even.";
+      await interaction.editReply({ content: `🔊 Je tijdelijke kanaal <#${channelId}> staat klaar!${movedNote}` });
+      await logToModChannel(`🔊 **${interaction.user.username}** maakte een voice-kanaal aan via de paneelknop (<#${channelId}>).`);
+    } catch (err) {
+      console.error("❌ Fout bij het aanmaken van een voice-kanaal via de paneelknop:", err.message);
+      try {
+        if (interaction.deferred || interaction.replied) {
+          await interaction.editReply({ content: "✨ Dat lukte niet — controleer of ik 'Kanalen beheren' heb in de juiste categorie." });
+        } else {
+          await interaction.reply({
+            content: "✨ Dat lukte niet — controleer of ik 'Kanalen beheren' heb in de juiste categorie.",
+            ephemeral: true,
+          });
+        }
+      } catch {}
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
   const { commandName } = interaction;
 
@@ -3408,6 +3480,18 @@ client.on("interactionCreate", async (interaction) => {
       } catch (err) {
         console.error("❌ Fout bij het samenvatten (slash-command):", err.message);
         await interaction.editReply({ content: "✨ Het samenvatten lukte nu niet, probeer het straks nog eens!" });
+      }
+      return;
+    }
+
+    if (commandName === "callembed") {
+      await interaction.deferReply({ ephemeral: true });
+      try {
+        await interaction.channel.send({ embeds: [buildVoicePanelEmbed()], components: buildVoicePanelComponents() });
+        await interaction.editReply({ content: "✅ Paneel geplaatst!" });
+      } catch (err) {
+        console.error("❌ Fout bij het opnieuw versturen van het voice-paneel:", err.message);
+        await interaction.editReply({ content: "✨ Dat lukte niet, probeer het nog eens." });
       }
       return;
     }
