@@ -379,6 +379,14 @@ const CHANGELOG_ENTRIES = [
   "🆕 Mini-polls, reactie-rollen, !raadmijn, veer van de week",
   "🆕 DM bij waarschuwingen, automatische onderhoudsmodus bij herhaalde AI-storingen",
   "🆕 Geplande aankondigingen en 'vraag het team'-escalatie naar het modkanaal",
+  "🆕 /afk met automatische melding bij tags, in elk kanaal",
+  "🆕 Tijdelijke, privé voice-kanalen + /call om iemand uit te nodigen",
+  "🆕 /embed — snel een nette embed bouwen (moderators)",
+  "🆕 /samenvat — laat de AI een kanaal samenvatten",
+  "🆕 Stille sentiment-tracking bij écht heftige berichten (alleen melding aan mods)",
+  "🆕 Automatische, tijdelijke Jarige-rol + /verjaardagen overzicht",
+  "🆕 Webhook-watchdog: meldt het als de webhook kapot is i.p.v. stil te falen",
+  "🆕 Slimmere, consistentere AI-antwoorden",
 ];
 
 function buildChangelogMessage() {
@@ -942,10 +950,10 @@ function buildHelpMessage() {
 • \`!changelog\` — wat is er onlangs toegevoegd?
 • \`!suggestie <tekst>\` — stuur een suggestie naar het team
 • \`/verjaardag [datum] [naam]\` — sla je verjaardag op (bijv. \`24-12\`), ik felicteer je dan automatisch
-• \`/verjaardagen\` — bekijk aankomende verjaardagen deze maand
-• \`/afk [reden]\` — zet jezelf op AFK, ik meld het automatisch als iemand je tagt
-• \`/samenvat [aantal]\` — vat de laatste berichten in dit kanaal samen
-• \`/call @gebruiker\` — nodig iemand uit in jouw tijdelijke voice-kanaal
+• \`/verjaardagen\` / \`!verjaardagen\` — bekijk aankomende verjaardagen deze maand
+• \`!afk [reden]\` / \`/afk [reden]\` — zet jezelf op AFK, ik meld het automatisch als iemand je tagt, werkt in elk kanaal
+• \`!samenvat [aantal]\` / \`/samenvat [aantal]\` — vat de laatste berichten in dit kanaal samen, werkt in elk kanaal
+• \`/call @gebruiker\` — nodig iemand uit in jouw tijdelijke voice-kanaal (join eerst het aanmaakkanaal voor je eigen kanaal)
 • \`!poll "vraag" optie1 | optie2\` — start een mini-poll (werkt in elk kanaal)
 • \`!raadmijn\` / \`!raadmijn stop\` — een klein raadspelletje
 • \`!veervandeweek [@gebruiker] [reden]\` — bekijk of wijs de Veer van de Week aan
@@ -956,7 +964,7 @@ function buildHelpMessage() {
 • \`!wis [aantal]\` — verwijdert berichten uit dit kanaal (alleen moderators)
 • \`!reactierol "titel" 🔴 @Rol\` — reactierol-bericht aanmaken, werkt in elk kanaal (alleen moderators)
 • \`!aankondig "tekst" op 20:00\` — plan een aankondiging in, werkt in elk kanaal (alleen moderators)
-• \`/embed\` — bouw snel een nette embed (alleen moderators)
+• \`!embed "titel" | "beschrijving" | #kleur\` / \`/embed\` — bouw snel een nette embed, werkt in elk kanaal (alleen moderators)
 • \`!startupdate [reden]\` — zet onderhoudsmodus aan (alleen moderators)
 • \`!stopupdate\` — zet onderhoudsmodus weer uit (alleen moderators)
 • \`!toggle <functie> <aan/uit>\` — zet een functie aan/uit (alleen moderators)
@@ -1066,17 +1074,67 @@ const client = new Client({
 
 const webhookClient = new WebhookClient({ url: DISCORD_WEBHOOK_URL });
 
+// ---------- Webhook-watchdog ----------
+// De webhook is de stem van FantasieVeer — als die kapot is (verwijderd/ongeldig,
+// HTTP 401/404) faalt normaal gesproken alles stil. Dit vangt dat op en meldt het
+// via de gewone bot-client (dus niet via de kapotte webhook zelf) naar het modkanaal,
+// met een cooldown zodat het geen spam wordt.
+const WEBHOOK_NOTICE_COOLDOWN_MS = 600000; // 10 minuten
+
+async function reportWebhookIssue(err) {
+  const status = err?.status || err?.rawError?.code;
+  const isDead = err?.status === 401 || err?.status === 404;
+  if (!isDead) return; // andere fouten (timeouts, 500's) zijn geen structureel "kapotte webhook"-signaal
+
+  webhookBroken = true;
+  if (Date.now() - webhookBrokenNoticeSentAt < WEBHOOK_NOTICE_COOLDOWN_MS) return;
+  webhookBrokenNoticeSentAt = Date.now();
+
+  console.error(`💥 De Discord-webhook lijkt ongeldig (HTTP ${err.status}) — berichten via de webhook falen stil!`);
+  try {
+    const channel = await fetchChannelSafe(MOD_LOG_CHANNEL_ID_RESOLVED);
+    if (channel) {
+      await channel.send({
+        content: moderatorMentions() || undefined,
+        embeds: [
+          {
+            title: "🔴 Webhook lijkt kapot",
+            description: `De webhook waarmee ik als "FantasieVeer" praat geeft een HTTP ${err.status} terug. Dit betekent meestal dat de webhook verwijderd of ongeldig is — maak een nieuwe aan en zet die in \`DISCORD_WEBHOOK_URL\`.`,
+            color: 0xed4245,
+            timestamp: new Date().toISOString(),
+          },
+        ],
+      });
+    }
+  } catch (notifyErr) {
+    console.error("💥 Kon zelfs geen webhook-storingsmelding versturen via de bot-client:", notifyErr.message);
+  }
+}
+
+function markWebhookHealthy() {
+  if (webhookBroken) {
+    webhookBroken = false;
+    console.log("✅ De webhook werkt weer normaal.");
+  }
+}
+
 async function sendAsVeer(channel, content, { mentionUsers = [], embeds = [] } = {}) {
   const chunks = splitMessage(content);
   for (let i = 0; i < chunks.length; i++) {
-    await webhookClient.send({
-      content: chunks[i],
-      embeds: i === 0 ? embeds : [],
-      username: "FantasieVeer",
-      avatarURL: FANTASIEVEER_AVATAR_URL || undefined,
-      threadId: channel.isThread() ? channel.id : undefined,
-      allowedMentions: { users: i === 0 ? mentionUsers : [] },
-    });
+    try {
+      await webhookClient.send({
+        content: chunks[i],
+        embeds: i === 0 ? embeds : [],
+        username: "FantasieVeer",
+        avatarURL: FANTASIEVEER_AVATAR_URL || undefined,
+        threadId: channel.isThread() ? channel.id : undefined,
+        allowedMentions: { users: i === 0 ? mentionUsers : [] },
+      });
+      markWebhookHealthy();
+    } catch (err) {
+      await reportWebhookIssue(err);
+      throw err;
+    }
   }
 }
 
@@ -1873,8 +1931,10 @@ async function sendStatusNotice(text) {
       username: "FantasieVeer",
       avatarURL: FANTASIEVEER_AVATAR_URL || undefined,
     });
+    markWebhookHealthy();
   } catch (err) {
     console.warn("⚠️ Kon statusmelding niet versturen:", err.message);
+    await reportWebhookIssue(err);
   }
 }
 
@@ -2098,6 +2158,9 @@ client.once("clientReady", async () => {
   // Geplande aankondigingen die de herstart hebben overleefd weer inplannen.
   rearmScheduledAnnouncements();
   console.log(`📅 ${scheduledAnnouncements.length} geplande aankondiging(en) actief.`);
+
+  // Infopaneel voor tijdelijke voice-kanalen plaatsen (als het er nog niet staat).
+  ensureVoicePanel().catch(() => {});
 });
 
 // ---------- Gedeelde logica ----------
@@ -3297,6 +3360,106 @@ client.on("interactionCreate", async (interaction) => {
           content: "✨ Er ging iets mis bij het wissen, misschien mis ik rechten of zijn de berichten te oud.",
         });
       }
+      return;
+    }
+
+    if (commandName === "afk") {
+      if (!isFeatureOn("afk")) {
+        await interaction.reply({ content: "✨ AFK-status staat momenteel uit.", ephemeral: true });
+        return;
+      }
+      const reason = interaction.options.getString("reden");
+      setAfk(interaction.user.id, reason);
+      await interaction.reply({
+        content: `💤 Je staat nu op AFK${reason ? `: _${reason}_` : ""}. Ik meld het automatisch als iemand je tagt!`,
+      });
+      return;
+    }
+
+    if (commandName === "verjaardagen") {
+      await interaction.reply({ content: buildUpcomingBirthdaysMessage(), ephemeral: true });
+      return;
+    }
+
+    if (commandName === "samenvat") {
+      if (!isFeatureOn("ai")) {
+        await interaction.reply({ content: "✨ AI-antwoorden staan momenteel uit, dus samenvatten lukt even niet.", ephemeral: true });
+        return;
+      }
+      const amount = interaction.options.getInteger("aantal") || 30;
+      await interaction.deferReply();
+      try {
+        const summary = await buildChannelSummary(interaction.channel, amount);
+        await interaction.editReply({ content: summary });
+      } catch (err) {
+        console.error("❌ Fout bij het samenvatten (slash-command):", err.message);
+        await interaction.editReply({ content: "✨ Het samenvatten lukte nu niet, probeer het straks nog eens!" });
+      }
+      return;
+    }
+
+    if (commandName === "call") {
+      const targetUser = interaction.options.getUser("gebruiker", true);
+      if (targetUser.bot) {
+        await interaction.reply({ content: "✨ Je kan geen bots uitnodigen!", ephemeral: true });
+        return;
+      }
+      if (targetUser.id === interaction.user.id) {
+        await interaction.reply({ content: "✨ Je zit er al in — nodig iemand anders uit!", ephemeral: true });
+        return;
+      }
+      const result = await inviteUserToTempChannel(interaction.user.id, targetUser, interaction.guild);
+      if (!result.ok) {
+        const message =
+          result.reason === "no-channel"
+            ? `✨ Je hebt nog geen eigen tijdelijk voice-kanaal — join eerst ${
+                VOICE_CREATE_CHANNEL_ID ? `<#${VOICE_CREATE_CHANNEL_ID}>` : "het aanmaakkanaal"
+              }!`
+            : "✨ Dat lukte niet — controleer of ik de rechten 'Kanalen beheren' heb in dat kanaal.";
+        await interaction.reply({ content: message, ephemeral: true });
+        return;
+      }
+      await interaction.reply({
+        content: `📞 <@${targetUser.id}> is uitgenodigd voor <#${result.channelId}>! (ook een DM verstuurd, indien mogelijk)`,
+        allowedMentions: { users: [targetUser.id] },
+      });
+      return;
+    }
+
+    if (commandName === "embed") {
+      if (!isModerator(interaction.user.id)) {
+        await interaction.reply({ content: "✨ Alleen moderators mogen embeds bouwen!", ephemeral: true });
+        return;
+      }
+      const title = interaction.options.getString("titel", true);
+      const description = interaction.options.getString("beschrijving", true);
+      const colorHex = interaction.options.getString("kleur");
+      const imageUrl = interaction.options.getString("afbeelding");
+      const thumbnailUrl = interaction.options.getString("thumbnail");
+      const footer = interaction.options.getString("footer");
+
+      if (colorHex && parseHexColor(colorHex) === null) {
+        await interaction.reply({ content: "✨ Die kleurcode snap ik niet — gebruik bijvoorbeeld `#57F287`.", ephemeral: true });
+        return;
+      }
+      if (!isLikelyUrl(imageUrl) || !isLikelyUrl(thumbnailUrl)) {
+        await interaction.reply({ content: "✨ Eén van de afbeelding-url's ziet er niet geldig uit.", ephemeral: true });
+        return;
+      }
+
+      const embed = buildCustomEmbed({
+        title,
+        description,
+        colorHex,
+        imageUrl,
+        thumbnailUrl,
+        footer,
+        author: interaction.user.username,
+      });
+      await interaction.deferReply({ ephemeral: true });
+      await interaction.channel.send({ embeds: [embed] });
+      await logToModChannel(`🖼️ **${interaction.user.username}** bouwde een embed in <#${interaction.channelId}> (via slash-command).`);
+      await interaction.editReply({ content: "✅ Embed geplaatst!" });
       return;
     }
   } catch (err) {
