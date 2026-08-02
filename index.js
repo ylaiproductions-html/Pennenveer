@@ -383,7 +383,7 @@ const CHANGELOG_ENTRIES = [
   "🆕 DM bij waarschuwingen, automatische onderhoudsmodus bij herhaalde AI-storingen",
   "🆕 Geplande aankondigingen en 'vraag het team'-escalatie naar het modkanaal",
   "🆕 /afk met automatische melding bij tags, in elk kanaal",
-  "🆕 Tijdelijke, privé voice-kanalen + /call om iemand uit te nodigen",
+  "🆕 Tijdelijke, privé voice-kanalen via /startcall (met onbeperkt aantal genodigden) of het aanmaakkanaal, plus /call",
   "🆕 /embed — snel een nette embed bouwen (moderators)",
   "🆕 /samenvat — laat de AI een kanaal samenvatten",
   "🆕 Stille sentiment-tracking bij écht heftige berichten (alleen melding aan mods)",
@@ -956,7 +956,8 @@ function buildHelpMessage() {
 • \`/verjaardagen\` / \`!verjaardagen\` — bekijk aankomende verjaardagen deze maand
 • \`!afk [reden]\` / \`/afk [reden]\` — zet jezelf op AFK, ik meld het automatisch als iemand je tagt, werkt in elk kanaal
 • \`!samenvat [aantal]\` / \`/samenvat [aantal]\` — vat de laatste berichten in dit kanaal samen, werkt in elk kanaal
-• \`/call @gebruiker\` — nodig iemand uit in jouw tijdelijke voice-kanaal (join eerst het aanmaakkanaal voor je eigen kanaal)
+• \`/startcall [gebruikers]\` — maak (of hergebruik) je tijdelijke voice-kanaal en nodig meteen wie je wil uit, geen limiet
+• \`/call @gebruiker\` — nodig later nog iemand extra uit in jouw tijdelijke voice-kanaal
 • \`!poll "vraag" optie1 | optie2\` — start een mini-poll (werkt in elk kanaal)
 • \`!raadmijn\` / \`!raadmijn stop\` — een klein raadspelletje
 • \`!veervandeweek [@gebruiker] [reden]\` — bekijk of wijs de Veer van de Week aan
@@ -1751,9 +1752,9 @@ function buildVoicePanelEmbed() {
     description: [
       VOICE_CREATE_CHANNEL_ID
         ? `Join <#${VOICE_CREATE_CHANNEL_ID}> en ik maak automatisch je eigen, privé voice-kanaal aan!`
-        : "Er is nog geen aanmaakkanaal ingesteld (VOICE_CREATE_CHANNEL_ID).",
+        : "Gebruik `/startcall` om direct je eigen, privé voice-kanaal aan te maken (en meteen mensen uit te nodigen).",
       "Jouw kanaal is standaard alleen voor jou zichtbaar en joinbaar.",
-      "Gebruik `/call @gebruiker` om iemand alsnog uit te nodigen in jouw kanaal.",
+      "Gebruik `/startcall @gebruiker1 @gebruiker2 ...` om er meteen mensen bij te tellen, of `/call @gebruiker` om er later nog iemand bij te vragen.",
       "Zodra iedereen het kanaal verlaat, ruim ik het automatisch weer op. ✨",
     ].join("\n"),
     color: 0x5865f2,
@@ -1782,7 +1783,7 @@ function sanitizeChannelNamePart(name) {
 
 async function createTempVoiceChannel(member, sourceChannel) {
   const guild = member.guild;
-  const parentId = VOICE_CATEGORY_ID_RESOLVED || sourceChannel.parentId || null;
+  const parentId = VOICE_CATEGORY_ID_RESOLVED || sourceChannel?.parentId || null;
 
   const overwrites = [
     { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] },
@@ -2086,6 +2087,15 @@ const slashCommands = [
     .setName("call")
     .setDescription("Nodig iemand uit in jouw tijdelijke voice-kanaal.")
     .addUserOption((option) => option.setName("gebruiker").setDescription("Wie uitnodigen").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("startcall")
+    .setDescription("Maak (of hergebruik) je tijdelijke voice-kanaal en nodig meteen mensen uit.")
+    .addStringOption((option) =>
+      option
+        .setName("gebruikers")
+        .setDescription("Tag de mensen die je wil uitnodigen, gescheiden door een spatie (optioneel, geen maximum)")
+        .setRequired(false)
+    ),
   new SlashCommandBuilder()
     .setName("embed")
     .setDescription("Bouw snel een nette embed (alleen moderators).")
@@ -3399,6 +3409,60 @@ client.on("interactionCreate", async (interaction) => {
         console.error("❌ Fout bij het samenvatten (slash-command):", err.message);
         await interaction.editReply({ content: "✨ Het samenvatten lukte nu niet, probeer het straks nog eens!" });
       }
+      return;
+    }
+
+    if (commandName === "startcall") {
+      if (!isFeatureOn("tempvoice")) {
+        await interaction.reply({ content: "✨ Tijdelijke voice-kanalen staan momenteel uit.", ephemeral: true });
+        return;
+      }
+      await interaction.deferReply();
+
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      let channelId = findOwnedTempChannel(interaction.user.id);
+      let channel = channelId ? await fetchChannelSafe(channelId) : null;
+
+      if (!channel) {
+        try {
+          channel = await createTempVoiceChannel(member, member.voice.channel || null);
+          channelId = channel.id;
+        } catch (err) {
+          console.error("❌ Fout bij het aanmaken van een voice-kanaal via /startcall:", err.message);
+          await interaction.editReply({
+            content: "✨ Dat lukte niet — controleer of ik 'Kanalen beheren' heb in de juiste categorie.",
+          });
+          return;
+        }
+      }
+
+      // Vrije lijst getagde gebruikers uit de tekst plukken, geen vast maximum.
+      const mentionInput = interaction.options.getString("gebruikers") || "";
+      const mentionedIds = [
+        ...new Set([...mentionInput.matchAll(/<@!?(\d+)>/g)].map((m) => m[1])),
+      ].filter((id) => id !== interaction.user.id);
+
+      const invited = [];
+      for (const userId of mentionedIds) {
+        try {
+          const targetUser = await client.users.fetch(userId);
+          if (targetUser.bot) continue;
+          const result = await inviteUserToTempChannel(interaction.user.id, targetUser, interaction.guild);
+          if (result.ok) invited.push(targetUser.id);
+        } catch (err) {
+          console.warn(`⚠️ Kon gebruiker ${userId} niet uitnodigen via /startcall:`, err.message);
+        }
+      }
+
+      const invitedText = invited.length
+        ? ` en ${invited.length} perso(o)n(en) uitgenodigd: ${invited.map((id) => `<@${id}>`).join(", ")}`
+        : "";
+      const movedNote = member.voice.channelId === channelId ? "" : " (join het kanaal zelf, ik kon je niet automatisch verplaatsen omdat je nog nergens in voice zat)";
+      await interaction.editReply({
+        content: `🔊 Je tijdelijke kanaal <#${channelId}> staat klaar${invitedText}!${movedNote}`,
+        allowedMentions: { users: invited },
+      });
+      await logToModChannel(`🔊 **${interaction.user.username}** startte een call via /startcall (kanaal <#${channelId}>).`);
       return;
     }
 
