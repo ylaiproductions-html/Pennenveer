@@ -58,7 +58,7 @@ const {
   DEBUG,
   // Tijdelijke voice-kanalen
   VOICE_CREATE_CHANNEL_ID, // het "➕ Kanaal maken"-voicekanaal; joinen hierin maakt een eigen kanaal aan
-  VOICE_CATEGORY_ID, // categorie waarin nieuwe tijdelijke kanalen worden aangemaakt (standaard: zelfde als het create-kanaal)
+  VOICE_CATEGORY_ID, // categorie waarin nieuwe tijdelijke kanalen worden aangemaakt (standaard: 1462256554844881018)
   VOICE_PANEL_CHANNEL_ID, // kanaal met het bedieningspaneel/uitleg voor tijdelijke voice-kanalen
   // Verjaardagsrol
   BIRTHDAY_ROLE_ID, // rol die iemand op zijn/haar verjaardag tijdelijk krijgt ("Jarige")
@@ -130,6 +130,9 @@ const PRICE_OUTPUT_PER_1M = parseFloat(GROQ_PRICE_PER_1M_OUTPUT || "0") || 0;
 // ---------- Tijdelijke voice-kanalen ----------
 // Standaard paneel-kanaal-ID zoals aangeleverd, aan te passen via VOICE_PANEL_CHANNEL_ID.
 const VOICE_PANEL_CHANNEL_ID_RESOLVED = VOICE_PANEL_CHANNEL_ID || "1533251665430446241";
+
+// Standaard categorie-ID voor tijdelijke voice-kanalen, aan te passen via VOICE_CATEGORY_ID.
+const VOICE_CATEGORY_ID_RESOLVED = VOICE_CATEGORY_ID || "1462256554844881018";
 
 // ---------- Sentiment-tracking ----------
 const SENTIMENT_COOLDOWN = parseInt(SENTIMENT_ALERT_COOLDOWN_MS || "900000", 10); // 15 minuten per kanaal
@@ -1035,6 +1038,7 @@ function buildConfigMessage() {
     `• Verjaardagskanaal: ${getBirthdayChannelId() ? `<#${getBirthdayChannelId()}>` : "niet ingesteld"}`,
     `• Jarige-rol: ${BIRTHDAY_ROLE_ID ? `<@&${BIRTHDAY_ROLE_ID}>` : "niet ingesteld"}`,
     `• Voice-aanmaakkanaal: ${VOICE_CREATE_CHANNEL_ID ? `<#${VOICE_CREATE_CHANNEL_ID}>` : "niet ingesteld"}`,
+    `• Voice-categorie: ${VOICE_CATEGORY_ID_RESOLVED}`,
     `• Voice-paneelkanaal: <#${VOICE_PANEL_CHANNEL_ID_RESOLVED}>`,
     `• Actieve tijdelijke voice-kanalen: ${tempVoiceChannels.size}`,
     `• Actieve AFK-statussen: ${afkMap.size}`,
@@ -1778,7 +1782,7 @@ function sanitizeChannelNamePart(name) {
 
 async function createTempVoiceChannel(member, sourceChannel) {
   const guild = member.guild;
-  const parentId = VOICE_CATEGORY_ID || sourceChannel.parentId || null;
+  const parentId = VOICE_CATEGORY_ID_RESOLVED || sourceChannel.parentId || null;
 
   const overwrites = [
     { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] },
