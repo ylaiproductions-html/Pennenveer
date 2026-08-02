@@ -137,6 +137,9 @@ const VOICE_PANEL_CHANNEL_ID_RESOLVED = VOICE_PANEL_CHANNEL_ID || "1533251665430
 // Standaard categorie-ID voor tijdelijke voice-kanalen, aan te passen via VOICE_CATEGORY_ID.
 const VOICE_CATEGORY_ID_RESOLVED = VOICE_CATEGORY_ID || "1462256554844881018";
 
+// Als niemand binnen deze tijd het nieuwe kanaal joint, wordt het automatisch weer opgeruimd.
+const TEMP_VOICE_EMPTY_TIMEOUT_MS = parseInt(process.env.TEMP_VOICE_EMPTY_TIMEOUT_MS || "120000", 10); // 2 minuten
+
 // ---------- Sentiment-tracking ----------
 const SENTIMENT_COOLDOWN = parseInt(SENTIMENT_ALERT_COOLDOWN_MS || "900000", 10); // 15 minuten per kanaal
 
@@ -301,6 +304,12 @@ function isModerator(userId) {
   return !MODERATOR_IDS.length || MODERATOR_IDS.includes(userId);
 }
 
+// Mod-commando's in !help/`/help` alleen tonen als je zowel mod bent ALS dit typt
+// in het modkanaal zelf — elders (of als niet-mod) zie je alleen de publieke lijst.
+function canSeeModHelp(userId, channelId) {
+  return isModerator(userId) && channelId === MOD_LOG_CHANNEL_ID_RESOLVED;
+}
+
 // ---------- Losse weetjes voor het !feit / /feit commando ----------
 const FUN_FACTS = [
   "Wist je dat ik ooit per ongeluk uit een betoverd schrijfboek ben gedwarreld? Zo ben ik in FantasieCraft beland! ✨",
@@ -388,6 +397,12 @@ const CHANGELOG_ENTRIES = [
   "🆕 /afk met automatische melding bij tags, in elk kanaal",
   "🆕 Tijdelijke, privé voice-kanalen via /startcall (met onbeperkt aantal genodigden) of het aanmaakkanaal, plus /call",
   "🆕 /callembed — stuurt het voice-infopaneel met een knop opnieuw, één klik = eigen voice-kanaal",
+  "🆕 Tijdelijke voice-kanalen ruimen zichzelf op als niemand binnen 2 minuten joint",
+  "🆕 /delete #kanaal — mods kunnen een tijdelijk voice-kanaal handmatig verwijderen",
+  "🆕 !help / /help toont mod-commando's alleen aan mods in het modkanaal zelf",
+  "🆕 !embed en /embed werken nu ook tijdens onderhoudsmodus",
+  "🆕 Onderhouds-embed wordt bewerkt (start → klaar), net als het statusembed",
+  "🆕 Onderhoudsmodus wordt direct opgeslagen i.p.v. na een paar seconden",
   "🆕 /embed — snel een nette embed bouwen (moderators)",
   "🆕 /samenvat — laat de AI een kanaal samenvatten",
   "🆕 Stille sentiment-tracking bij écht heftige berichten (alleen melding aan mods)",
@@ -466,6 +481,7 @@ let stateDirty = false;
 
 let maintenanceMode = false;
 let maintenanceSince = null;
+let maintenanceMessageId = null;
 let statusMessageId = null;
 
 // Reactierollen: messageId -> Map(emoji -> roleId)
@@ -580,6 +596,7 @@ async function loadState() {
     if (parsed.stats) stats = parsed.stats;
     if (typeof parsed.maintenanceMode === "boolean") maintenanceMode = parsed.maintenanceMode;
     if (typeof parsed.maintenanceSince === "number") maintenanceSince = parsed.maintenanceSince;
+    if (typeof parsed.maintenanceMessageId === "string") maintenanceMessageId = parsed.maintenanceMessageId;
     if (typeof parsed.statusMessageId === "string") statusMessageId = parsed.statusMessageId;
     if (parsed.featureToggles && typeof parsed.featureToggles === "object") {
       featureToggles = { ...DEFAULT_TOGGLES, ...parsed.featureToggles };
@@ -619,6 +636,7 @@ async function saveState() {
       stats,
       maintenanceMode,
       maintenanceSince,
+      maintenanceMessageId,
       statusMessageId,
       featureToggles,
       reactionRoles: Object.fromEntries(
@@ -644,6 +662,18 @@ function scheduleSave() {
     saveTimer = null;
     saveState();
   }, 3000);
+}
+
+// Voor kritieke state (bv. onderhoudsmodus) willen we niet wachten op de debounce van
+// 3 seconden — als het proces vlak daarna herstart (bv. door een Railway-deploy) kan
+// die wijziging anders verloren gaan. Dit dwingt een directe schrijfactie af.
+async function saveStateImmediate() {
+  stateDirty = true;
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  await saveState();
 }
 
 function getHistory(channelId) {
@@ -949,36 +979,53 @@ Dit kan je in deze chat doen:
 
 Blijf vriendelijk tegen elkaar, dan wordt het hier alleen maar magischer! ✨`;
 
-function buildHelpMessage() {
-  return `🪶 **FantasieVeer commando's** (werkt met \`!\` of als slash-commando):
-• \`!startbericht\` — toont het welkomstbericht
-• \`!feit\` — een willekeurig FantasieCraft-weetje
-• \`!stats\` — een paar statistieken over mij
-• \`!changelog\` — wat is er onlangs toegevoegd?
-• \`!suggestie <tekst>\` — stuur een suggestie naar het team
-• \`/verjaardag [datum] [naam]\` — sla je verjaardag op (bijv. \`24-12\`), ik felicteer je dan automatisch
-• \`/verjaardagen\` / \`!verjaardagen\` — bekijk aankomende verjaardagen deze maand
-• \`!afk [reden]\` / \`/afk [reden]\` — zet jezelf op AFK, ik meld het automatisch als iemand je tagt, werkt in elk kanaal
-• \`!samenvat [aantal]\` / \`/samenvat [aantal]\` — vat de laatste berichten in dit kanaal samen, werkt in elk kanaal
-• \`/startcall [gebruikers]\` — maak (of hergebruik) je tijdelijke voice-kanaal en nodig meteen wie je wil uit, geen limiet
-• \`/call @gebruiker\` — nodig later nog iemand extra uit in jouw tijdelijke voice-kanaal
-• \`/callembed\` — stuur het infopaneel voor voice-kanalen (met knop) opnieuw in dit kanaal
-• \`!poll "vraag" optie1 | optie2\` — start een mini-poll (werkt in elk kanaal)
-• \`!raadmijn\` / \`!raadmijn stop\` — een klein raadspelletje
-• \`!veervandeweek [@gebruiker] [reden]\` — bekijk of wijs de Veer van de Week aan
-• \`!reset\` — wist mijn geheugen van dit gesprek (alleen moderators)
-• \`!waarschuwingen @gebruiker\` — bekijk waarschuwingen van iemand (alleen moderators)
-• \`!warnreset @gebruiker\` — wist de waarschuwingen van iemand en heft een mute meteen op (alleen moderators)
-• \`!tijdelijkmute @gebruiker [minuten]\` — negeert iemand tijdelijk (alleen moderators)
-• \`!wis [aantal]\` — verwijdert berichten uit dit kanaal (alleen moderators)
-• \`!reactierol "titel" 🔴 @Rol\` — reactierol-bericht aanmaken, werkt in elk kanaal (alleen moderators)
-• \`!aankondig "tekst" op 20:00\` — plan een aankondiging in, werkt in elk kanaal (alleen moderators)
-• \`!embed "titel" | "beschrijving" | #kleur\` / \`/embed\` — bouw snel een nette embed, werkt in elk kanaal (alleen moderators)
-• \`!startupdate [reden]\` — zet onderhoudsmodus aan (alleen moderators)
-• \`!stopupdate\` — zet onderhoudsmodus weer uit (alleen moderators)
-• \`!toggle <functie> <aan/uit>\` — zet een functie aan/uit (alleen moderators)
-• \`!config\` — toont de huidige instellingen (alleen moderators)
-• \`!help\` — toont dit berichtje`;
+function buildHelpMessage(showModCommands) {
+  const publicLines = [
+    '• `!startbericht` — toont het welkomstbericht',
+    '• `!feit` — een willekeurig FantasieCraft-weetje',
+    '• `!stats` — een paar statistieken over mij',
+    '• `!changelog` — wat is er onlangs toegevoegd?',
+    '• `!suggestie <tekst>` — stuur een suggestie naar het team',
+    '• `/verjaardag [datum] [naam]` — sla je verjaardag op (bijv. `24-12`), ik felicteer je dan automatisch',
+    '• `/verjaardagen` / `!verjaardagen` — bekijk aankomende verjaardagen deze maand',
+    '• `!afk [reden]` / `/afk [reden]` — zet jezelf op AFK, ik meld het automatisch als iemand je tagt, werkt in elk kanaal',
+    '• `!samenvat [aantal]` / `/samenvat [aantal]` — vat de laatste berichten in dit kanaal samen, werkt in elk kanaal',
+    '• `/startcall [gebruikers]` — maak (of hergebruik) je tijdelijke voice-kanaal en nodig meteen wie je wil uit, geen limiet',
+    '• `/call @gebruiker` — nodig later nog iemand extra uit in jouw tijdelijke voice-kanaal',
+    '• `/callembed` — stuur het infopaneel voor voice-kanalen (met knop) opnieuw in dit kanaal',
+    '• `!poll "vraag" optie1 | optie2` — start een mini-poll (werkt in elk kanaal)',
+    '• `!raadmijn` / `!raadmijn stop` — een klein raadspelletje',
+    '• `!veervandeweek [@gebruiker] [reden]` — bekijk of wijs de Veer van de Week aan',
+    '• `!help` — toont dit berichtje',
+  ];
+
+  const modLines = [
+    '• `!reset` — wist mijn geheugen van dit gesprek',
+    '• `!waarschuwingen @gebruiker` — bekijk waarschuwingen van iemand',
+    '• `!warnreset @gebruiker` — wist de waarschuwingen van iemand en heft een mute meteen op',
+    '• `!tijdelijkmute @gebruiker [minuten]` — negeert iemand tijdelijk',
+    '• `!wis [aantal]` — verwijdert berichten uit dit kanaal',
+    '• `!reactierol "titel" 🔴 @Rol` — reactierol-bericht aanmaken, werkt in elk kanaal',
+    '• `!aankondig "tekst" op 20:00` — plan een aankondiging in, werkt in elk kanaal',
+    '• `!embed "titel" | "beschrijving" | #kleur` / `/embed` — bouw snel een nette embed, werkt in elk kanaal, ook tijdens onderhoud/storingen',
+    '• `/delete #kanaal` — verwijder een tijdelijk voice-kanaal',
+    '• `!startupdate [reden]` — zet onderhoudsmodus aan',
+    '• `!stopupdate` — zet onderhoudsmodus weer uit',
+    '• `!toggle <functie> <aan/uit>` — zet een functie aan/uit',
+    '• `!config` — toont de huidige instellingen',
+  ];
+
+  const lines = [`🪶 **FantasieVeer commando's** (werkt met \`!\` of als slash-commando):`, ...publicLines];
+
+  if (showModCommands) {
+    lines.push(
+      "",
+      "🔒 **Mod-commando's** (alleen zichtbaar omdat je mod bent én dit in het modkanaal typt):",
+      ...modLines
+    );
+  }
+
+  return lines.join("\n");
 }
 
 function buildStatsMessage() {
@@ -1050,6 +1097,8 @@ function buildConfigMessage() {
     `• Actieve AFK-statussen: ${afkMap.size}`,
     `• Webhook-status: ${webhookBroken ? "🔴 werkt niet (zie logs)" : "🟢 werkt"}`,
     `• Onderhoudsmodus: ${maintenanceMode ? "🔧 aan" : "uit"} (auto bij ${AUTO_MAINTENANCE_THRESHOLD} AI-fouten op rij, nu: ${consecutiveGroqFailures})`,
+    `• Onderhouds-embed getrackt: ${maintenanceMessageId ? `ja (${maintenanceMessageId})` : "nee"}`,
+    `• State-bestand: \`${STATE_PATH}\` — let op: dit moet op een *persistent volume* staan, anders overleeft onderhoudsmodus geen herstart/deploy!`,
     `• Actieve reactierol-berichten: ${REACTION_ROLES_ENABLED ? reactionRolesMap.size : "uitgeschakeld (ENABLE_REACTION_ROLES=false)"}`,
     `• Geplande aankondigingen: ${scheduledAnnouncements.length}`,
     `• Veer van de Week: ${veerVanDeWeek ? veerVanDeWeek.name : "niet aangewezen"}`,
@@ -1130,9 +1179,10 @@ function markWebhookHealthy() {
 
 async function sendAsVeer(channel, content, { mentionUsers = [], embeds = [] } = {}) {
   const chunks = splitMessage(content);
+  let lastSent = null;
   for (let i = 0; i < chunks.length; i++) {
     try {
-      await webhookClient.send({
+      lastSent = await webhookClient.send({
         content: chunks[i],
         embeds: i === 0 ? embeds : [],
         username: "FantasieVeer",
@@ -1146,6 +1196,7 @@ async function sendAsVeer(channel, content, { mentionUsers = [], embeds = [] } =
       throw err;
     }
   }
+  return lastSent;
 }
 
 // ---------- Kanalen ophalen (voor modkanaal / statuskanaal / verjaardagen) ----------
@@ -1803,6 +1854,29 @@ function sanitizeChannelNamePart(name) {
   return name.replace(/[^\p{L}\p{N} _-]/gu, "").slice(0, 20).trim() || "speler";
 }
 
+// Als er 2 minuten na aanmaken nog steeds niemand in het kanaal zit, ruimen we het
+// automatisch weer op — voorkomt "spooksnkanalen" van mensen die toch niet joinden.
+function armEmptyChannelTimeout(channelId) {
+  setTimeout(async () => {
+    if (!tempVoiceChannels.has(channelId)) return; // al verwijderd, of geen tijdelijk kanaal (meer)
+    const channel = await fetchChannelSafe(channelId);
+    if (!channel) {
+      tempVoiceChannels.delete(channelId);
+      return;
+    }
+    if (channel.members.size === 0) {
+      try {
+        await channel.delete("Niemand joinde binnen 2 minuten na het aanmaken.");
+        console.log(`🧹 Tijdelijk voice-kanaal opgeruimd (niemand kwam binnen ${Math.round(TEMP_VOICE_EMPTY_TIMEOUT_MS / 60000)} min): ${channelId}`);
+      } catch (err) {
+        console.warn(`⚠️ Kon leeg tijdelijk voice-kanaal niet verwijderen (timeout, ${channelId}):`, err.message);
+      } finally {
+        tempVoiceChannels.delete(channelId);
+      }
+    }
+  }, TEMP_VOICE_EMPTY_TIMEOUT_MS);
+}
+
 async function createTempVoiceChannel(member, sourceChannel) {
   const guild = member.guild;
   const parentId = VOICE_CATEGORY_ID_RESOLVED || sourceChannel?.parentId || null;
@@ -1834,6 +1908,7 @@ async function createTempVoiceChannel(member, sourceChannel) {
   });
 
   tempVoiceChannels.set(channel.id, { ownerId: member.id, isPrivate: true, createdAt: Date.now() });
+  armEmptyChannelTimeout(channel.id);
 
   try {
     await member.voice.setChannel(channel.id);
@@ -2122,6 +2197,16 @@ const slashCommands = [
     .setName("callembed")
     .setDescription("Stuur het infopaneel voor tijdelijke voice-kanalen (met knop) opnieuw in dit kanaal."),
   new SlashCommandBuilder()
+    .setName("delete")
+    .setDescription("Verwijder een tijdelijk voice-kanaal (alleen moderators).")
+    .addChannelOption((option) =>
+      option
+        .setName("kanaal")
+        .setDescription("Het tijdelijke voice-kanaal dat verwijderd moet worden")
+        .setRequired(true)
+        .addChannelTypes(ChannelType.GuildVoice)
+    ),
+  new SlashCommandBuilder()
     .setName("embed")
     .setDescription("Bouw snel een nette embed (alleen moderators).")
     .addStringOption((option) => option.setName("titel").setDescription("Titel van de embed").setRequired(true))
@@ -2244,8 +2329,18 @@ async function announceEscalation(channel, userId, username) {
 async function handleStartUpdate(channel, reason) {
   maintenanceMode = true;
   maintenanceSince = Date.now();
-  scheduleSave();
-  await sendAsVeer(channel, "", { embeds: [buildUpdateEmbed(reason)] });
+
+  try {
+    const sent = await sendAsVeer(channel, "", { embeds: [buildUpdateEmbed(reason)] });
+    maintenanceMessageId = sent?.id || null;
+  } catch (err) {
+    maintenanceMessageId = null;
+    console.error("❌ Kon het onderhouds-embed niet versturen:", err.message);
+  }
+
+  // Direct opslaan (niet pas na 3s) — anders overleeft dit een snelle herstart/deploy niet.
+  await saveStateImmediate();
+
   await logToModChannel("", {
     title: "🔧 Onderhoudsmodus aangezet",
     description: reason ? `Reden: ${reason}` : "Geen reden opgegeven.",
@@ -2256,10 +2351,37 @@ async function handleStartUpdate(channel, reason) {
 
 async function handleStopUpdate(channel) {
   const since = maintenanceSince || Date.now();
+  const doneEmbed = buildUpdateDoneEmbed(Date.now() - since);
+
+  // Bewerk hetzelfde bericht dat bij /startupdate is verstuurd (net als het statusembed),
+  // in plaats van een los nieuw bericht te sturen.
+  let edited = false;
+  if (maintenanceMessageId) {
+    try {
+      await webhookClient.editMessage(maintenanceMessageId, { embeds: [doneEmbed] });
+      markWebhookHealthy();
+      edited = true;
+    } catch (err) {
+      console.warn("⚠️ Kon het onderhouds-embed niet bewerken (mogelijk verwijderd), stuur een nieuw bericht:", err.message);
+      await reportWebhookIssue(err);
+    }
+  }
+
+  if (!edited) {
+    try {
+      await sendAsVeer(channel, "", { embeds: [doneEmbed] });
+    } catch (err) {
+      console.warn("⚠️ Kon het onderhoud-klaar-bericht niet versturen:", err.message);
+    }
+  }
+
   maintenanceMode = false;
   maintenanceSince = null;
-  scheduleSave();
-  await sendAsVeer(channel, "", { embeds: [buildUpdateDoneEmbed(Date.now() - since)] });
+  maintenanceMessageId = null;
+
+  // Ook hier direct opslaan, om dezelfde reden als bij het aanzetten.
+  await saveStateImmediate();
+
   await logToModChannel("", {
     title: "✅ Onderhoudsmodus uitgezet",
     color: 0x57f287,
@@ -2289,7 +2411,7 @@ client.on("messageCreate", async (message) => {
 
   const trimmedContent = message.content.trim().toLowerCase();
 
-  // ----- Onderhoudsmodus: negeer IEDEREEN, behalve !stopupdate van een moderator. -----
+  // ----- Onderhoudsmodus: negeer IEDEREEN, behalve !stopupdate en !embed (mods) -----
   if (maintenanceMode) {
     if (trimmedContent === "!stopupdate" && isModerator(message.author.id)) {
       try {
@@ -2298,10 +2420,15 @@ client.on("messageCreate", async (message) => {
       } catch (err) {
         console.error("❌ Fout bij het uitzetten van onderhoudsmodus:", err.message);
       }
-    } else {
-      debugLog(`Onderhoudsmodus actief, bericht van ${message.author.username} genegeerd.`);
+      return;
     }
-    return;
+    const isEmbedDuringMaintenance = trimmedContent.startsWith("!embed") && isModerator(message.author.id);
+    if (!isEmbedDuringMaintenance) {
+      debugLog(`Onderhoudsmodus actief, bericht van ${message.author.username} genegeerd.`);
+      return;
+    }
+    // !embed van een moderator mag er tijdens onderhoud gewoon doorheen — val door naar
+    // de normale !embed-afhandeling verderop in deze functie.
   }
 
   // ----- Commando's die in ELK kanaal werken, ook buiten TARGET_CHANNEL_IDS. -----
@@ -2568,7 +2695,7 @@ client.on("messageCreate", async (message) => {
 
   if (trimmedContent === "!help") {
     try {
-      await sendAsVeer(message.channel, buildHelpMessage());
+      await sendAsVeer(message.channel, buildHelpMessage(canSeeModHelp(message.author.id, message.channelId)));
     } catch (err) {
       console.error("❌ Fout bij het versturen van het help-bericht:", err.message);
     }
@@ -3149,8 +3276,8 @@ client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   const { commandName } = interaction;
 
-  // Tijdens onderhoud werkt alleen /stopupdate nog, en alleen voor moderators.
-  if (maintenanceMode && commandName !== "stopupdate") {
+  // Tijdens onderhoud werkt alleen /stopupdate en /embed (mods) nog.
+  if (maintenanceMode && commandName !== "stopupdate" && commandName !== "embed") {
     try {
       await interaction.reply({
         content: "🔧 FantasieVeer is momenteel in onderhoudsmodus en reageert zo weer terug!",
@@ -3189,7 +3316,7 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (commandName === "help") {
-      await interaction.reply({ content: buildHelpMessage(), ephemeral: true });
+      await interaction.reply({ content: buildHelpMessage(canSeeModHelp(interaction.user.id, interaction.channelId)), ephemeral: true });
       return;
     }
 
@@ -3480,6 +3607,36 @@ client.on("interactionCreate", async (interaction) => {
       } catch (err) {
         console.error("❌ Fout bij het samenvatten (slash-command):", err.message);
         await interaction.editReply({ content: "✨ Het samenvatten lukte nu niet, probeer het straks nog eens!" });
+      }
+      return;
+    }
+
+    if (commandName === "delete") {
+      if (!isModerator(interaction.user.id)) {
+        await interaction.reply({ content: "✨ Alleen moderators mogen voice-kanalen verwijderen!", ephemeral: true });
+        return;
+      }
+      const channelOption = interaction.options.getChannel("kanaal", true);
+      if (!tempVoiceChannels.has(channelOption.id)) {
+        await interaction.reply({
+          content: "✨ Dat is geen tijdelijk voice-kanaal dat ik beheer — ik verwijder alleen kanalen die ik zelf heb aangemaakt.",
+          ephemeral: true,
+        });
+        return;
+      }
+      try {
+        const channelName = channelOption.name;
+        await channelOption.delete(`Handmatig verwijderd door moderator ${interaction.user.username}`);
+        tempVoiceChannels.delete(channelOption.id);
+        await interaction.reply({ content: `🧹 Voice-kanaal **${channelName}** is verwijderd.`, ephemeral: true });
+        await logToModChannel(`🧹 **${interaction.user.username}** verwijderde handmatig het tijdelijke voice-kanaal **${channelName}** (via slash-command).`);
+        console.log(`🧹 Tijdelijk voice-kanaal ${channelOption.id} handmatig verwijderd door ${interaction.user.username}.`);
+      } catch (err) {
+        console.error("❌ Fout bij het handmatig verwijderen van een voice-kanaal:", err.message);
+        await interaction.reply({
+          content: "✨ Dat lukte niet — controleer of ik 'Kanalen beheren' heb.",
+          ephemeral: true,
+        });
       }
       return;
     }
