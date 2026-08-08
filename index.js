@@ -209,59 +209,6 @@ function containsBannedWord(text) {
   return false;
 }
 
-// ---------- Woordfilter: bericht laten herschrijven door de AI (Roblox-stijl) ----------
-// Een scheldwoord middenin de zin simpelweg vervangen door één vast woord levert bijna
-// nooit een kloppende zin op. Daarom laat de AI het HELE bericht herschrijven: dezelfde
-// taal/betekenis/toon, maar dan netjes en zonder grove taal. Dit hieronder is alleen de
-// DETECTIE; het herschrijven zelf gebeurt in rewriteMessageWithAi() (verderop, want die
-// heeft de Groq-aanroep-functies nodig). FILTER_REPLACEMENT_MESSAGE is puur de allerlaatste
-// noodgreep als de AI-aanroep zelf faalt (storing, timeout, o.i.d.).
-const FILTER_REPLACEMENT_MESSAGE =
-  (process.env.FILTER_REPLACEMENT_MESSAGE || "Dit bericht bevatte ongepaste taal en is aangepast.").trim() ||
-  "Dit bericht bevatte ongepaste taal en is aangepast.";
-
-const REVERSE_LEET_MAP = {};
-for (const [digit, letter] of Object.entries(LEET_MAP)) {
-  (REVERSE_LEET_MAP[letter] ||= []).push(digit);
-}
-
-// Zet een los karakter om in een veilige, regex-character-class-vriendelijke variant.
-function classSafeChar(ch) {
-  return ch.replace(/[\]\\^-]/g, "\\$&");
-}
-
-// Bouwt voor één verboden woord een "fuzzy" regex die matcht op:
-// - de gewone spelling (hoofdletterongevoelig)
-// - leetspeak-varianten van elke letter (bv. "s" ook als "5" of "$")
-// - uitgerekte letters (bv. "shiiiit")
-// - losse letters met tussenliggende spaties/leestekens (bv. "s h i t", "s.h.i.t")
-function buildFuzzyWordRegex(word) {
-  const letters = word.toLowerCase().split("");
-  const letterGroups = letters.map((ch) => {
-    const alternatives = [ch, ...(REVERSE_LEET_MAP[ch] || [])].map(classSafeChar);
-    return `[${alternatives.join("")}]+`; // "+" vangt uitgerekte letters op
-  });
-  // Tussen elke letter mag een klein beetje "ruis" zitten (spatie, punt, streepje, ...)
-  const body = letterGroups.join(`[^\\p{L}\\p{N}]{0,2}`);
-  // De haakjes rond (^|[^\p{L}\p{N}]) zorgen dat we alleen op woordgrenzen matchen,
-  // zodat we geen stukjes uit onschuldige langere woorden knippen.
-  return new RegExp(`(^|[^\\p{L}\\p{N}])(?:${body})(?=[^\\p{L}\\p{N}]|$)`, "giu");
-}
-
-const fuzzyBannedWordRegexes = BANNED_WORD_LIST.map((word) => buildFuzzyWordRegex(word));
-
-// Detecteert of ergens in de tekst een verboden woord voorkomt (incl. leetspeak/
-// uitgerekt/uit-elkaar-getrokken varianten).
-function detectBannedWords(text) {
-  if (!BANNED_WORD_LIST.length) return false;
-  return fuzzyBannedWordRegexes.some((regex) => {
-    regex.lastIndex = 0;
-    return regex.test(text);
-  });
-}
-
-
-
 // ---------- Trefwoord-afbeeldingen ----------
 let TRIGGER_IMAGE_MAP = {};
 if (TRIGGER_IMAGES) {
@@ -440,7 +387,6 @@ function buildRaadmijnHint(answer) {
 // ---------- !changelog ----------
 const CHANGELOG_ENTRIES = [
   "🆕 Slimmer woordfilter (leetspeak, uitgerekte letters, uit-elkaar-getrokken woorden)",
-  "🆕 Berichten met scheldwoorden worden nu automatisch door de AI netjes herschreven (net als een Roblox-chatfilter, maar dan met behoud van de zin)",
   "🆕 Onderhoudsmodus (/startupdate, /stopupdate) met afwisselende berichten",
   "🆕 FAQ-herkenning, modkanaal-logging, suggestiebox",
   "🆕 Verjaardagen, tijdelijke mutes, live statuskanaal, kostenteller",
@@ -894,7 +840,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function callGroq(model, messages, { timeoutMs = 20000, temperature = 0.75, maxTokens = 320 } = {}) {
+async function callGroq(model, messages, { timeoutMs = 20000 } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -907,8 +853,8 @@ async function callGroq(model, messages, { timeoutMs = 20000, temperature = 0.75
       body: JSON.stringify({
         model,
         messages,
-        temperature,
-        max_tokens: maxTokens,
+        temperature: 0.75,
+        max_tokens: 320,
         presence_penalty: 0.3,
         frequency_penalty: 0.2,
       }),
@@ -925,7 +871,7 @@ async function callGroq(model, messages, { timeoutMs = 20000, temperature = 0.75
   }
 }
 
-async function callGroqWithRetries(messages, { temperature, maxTokens } = {}) {
+async function callGroqWithRetries(messages) {
   const attempts = [
     { model: MODEL, delay: 0 },
     { model: MODEL, delay: 700 },
@@ -937,7 +883,7 @@ async function callGroqWithRetries(messages, { temperature, maxTokens } = {}) {
     if (attempt.delay) await sleep(attempt.delay);
     try {
       debugLog(`Groq-poging met model ${attempt.model}...`);
-      return await callGroq(attempt.model, messages, { temperature, maxTokens });
+      return await callGroq(attempt.model, messages);
     } catch (err) {
       lastError = err;
       console.warn(`⚠️ Groq-poging mislukt (${attempt.model}): ${err.message}`);
@@ -990,78 +936,22 @@ async function askFantasieVeer(channelId, username, userMessage) {
 }
 
 // ---------- Generieke, persona-loze AI-aanroep (voor bv. !samenvat) ----------
-async function askGroqRaw(systemPrompt, userPrompt, { maxTokens = 400, temperature } = {}) {
+async function askGroqRaw(systemPrompt, userPrompt, { maxTokens = 400 } = {}) {
   const messages = [
     { role: "system", content: systemPrompt },
     { role: "user", content: userPrompt },
   ];
-  const data = await callGroqWithRetries(messages, { temperature, maxTokens });
+  const data = await callGroqWithRetries(messages);
   if (data?.usage) {
     bumpTokenStats(data.usage.prompt_tokens, data.usage.completion_tokens);
   }
-  const content = data?.choices?.[0]?.message?.content?.trim();
-  // BELANGRIJK: geen canned fallback-tekst teruggeven bij een lege reactie — dat zou
-  // door aanroepers (zoals de woordfilter) per ongeluk als geldig AI-antwoord gezien
-  // kunnen worden. In plaats daarvan een fout gooien, zodat elke aanroeper zijn eigen,
-  // passende fallback kan tonen.
-  if (!content) {
-    throw new Error("Groq gaf een lege reactie terug (geen content in het antwoord).");
-  }
-  return content;
+  return (
+    data?.choices?.[0]?.message?.content?.trim() ||
+    "✨ Ik kon daar even geen antwoord op verzinnen, probeer het nog eens!"
+  );
 }
 
-// ---------- Woordfilter: bericht laten herschrijven door de AI ----------
-// De AI herschrijft het volledige bericht: zelfde taal/betekenis/toon, maar zonder
-// grove taal — de AI kiest zelf de meest natuurlijke, nette formulering (geen vast
-// "vervangwoord" meer, want dat leverde kromme zinnen op zoals "haat you").
-const FILTER_REWRITE_SYSTEM_PROMPT = `
-Je herschrijft een Discord-bericht dat grove taal, scheldwoorden of beledigingen bevat, zodat het netjes leesbaar wordt.
-
-Regels, volg deze STRIKT:
-- Herschrijf het VOLLEDIGE bericht als één natuurlijke, kloppende zin (of kort berichtje) — nooit een los woord of een afgebroken halve zin als antwoord.
-- Verwijder of vervang elk scheldwoord, grove uitdrukking of belediging door gepaste, nette taal. Je mag zelf de beste, meest natuurlijke formulering kiezen — er is geen vast vervangwoord verplicht.
-- Het gevoel/de toon van het origineel (bijvoorbeeld frustratie, boosheid, enthousiasme, afkeuring) mag blijven staan, zolang het maar netjes verwoord is — je hoeft negatieve emotie niet weg te poetsen, alleen de grove taal.
-- Gebruik NOOIT het scheldwoord zelf, ook niet gedeeltelijk, verbogen of in een andere spelling.
-- De rest van de betekenis, context en taal waarin het geschreven is (Nederlands blijft Nederlands, Engels blijft Engels, enzovoort) blijft zoveel mogelijk hetzelfde.
-- Antwoord ALLEEN met de herschreven zin zelf: geen aanhalingstekens, geen uitleg, geen emoji's, geen extra zinnen erbij.
-- Als er na het weghalen van de grove taal niets zinnigs overblijft, verzin dan een korte, neutrale zin die past bij de situatie.
-
-Voorbeelden (alleen ter illustratie van het gewenste formaat en de gewenste toon, niet om letterlijk te kopiëren):
-Bericht: "fuck you"
-Herschreven: Ik erger me enorm aan jou.
-
-Bericht: "this game is shit"
-Herschreven: Dit spel vind ik niet goed.
-
-Bericht: "kanker weer vandaag zeg"
-Herschreven: Wat een rot weer vandaag zeg.
-
-Bericht: "shut up you fucking idiot"
-Herschreven: Hou je mond, sukkel.
-
-Bericht: "omg this is so fucking cool"
-Herschreven: Omg, dit is zo ontzettend cool.
-`.trim();
-
-async function rewriteMessageWithAi(originalContent) {
-  try {
-    const rewritten = await askGroqRaw(FILTER_REWRITE_SYSTEM_PROMPT, originalContent, {
-      maxTokens: 150,
-      temperature: 0.4, // laag genoeg voor consistente, natuurlijke herschrijvingen
-    });
-    const cleaned = rewritten.trim().replace(/^["'“”]+|["'“”]+$/g, "").trim();
-    const wordCount = cleaned.split(/\s+/).filter(Boolean).length;
-    // Extra veiligheidsnet: als de AI leeg, te kort, of nog steeds een verboden
-    // woord teruggeeft (bv. bij een storing of rare output), val terug op het vaste bericht.
-    if (!cleaned || wordCount < 2 || detectBannedWords(cleaned)) return FILTER_REPLACEMENT_MESSAGE;
-    return cleaned;
-  } catch (err) {
-    console.warn("⚠️ Kon bericht niet laten herschrijven door de AI, val terug op vast bericht:", err.message);
-    return FILTER_REPLACEMENT_MESSAGE;
-  }
-}
-
-
+// ---------- Berichten opsplitsen (Discord-limiet is 2000 tekens) ----------
 function splitMessage(content, maxLen = 1900) {
   if (!content) return [""];
   if (content.length <= maxLen) return [content];
@@ -1192,7 +1082,6 @@ function buildConfigMessage() {
     `• Max berichtlengte naar AI: ${MAX_MSG_LEN} tekens`,
     `• Escalatie: ${ESCALATION_LIMIT} overtredingen / ${Math.round(ESCALATION_WINDOW / 60000)} min → mute van ${Math.round(MUTE_DURATION / 60000)} min`,
     `• Verboden woorden ingesteld: ${BANNED_WORD_LIST.length}`,
-    `• Filter-noodgreepbericht (bij AI-storing): "${FILTER_REPLACEMENT_MESSAGE}"`,
     `• FAQ-items: ${FAQ_ENTRIES_LIST.length}`,
     `• Moderators: ${MODERATOR_IDS.length}`,
     `• Doelkanalen: ${TARGET_CHANNEL_IDS.length ? TARGET_CHANNEL_IDS.join(", ") : "alle kanalen"}`,
@@ -1306,79 +1195,6 @@ async function sendAsVeer(channel, content, { mentionUsers = [], embeds = [] } =
       await reportWebhookIssue(err);
       throw err;
     }
-  }
-  return lastSent;
-}
-
-// Stuurt een bericht via de webhook, maar "vermomd" als de oorspronkelijke auteur
-// (zelfde naam + avatar). Wordt gebruikt om een gefilterd bericht terug te plaatsen
-// nadat het origineel (met scheldwoorden) is verwijderd — net als een chatfilter dat
-// het bericht zelf aanpast in plaats van het te blokkeren.
-//
-// BELANGRIJK: een Discord-webhook hoort altijd bij ÉÉN vast kanaal — DISCORD_WEBHOOK_URL
-// kan dus alleen berichten posten in het kanaal waar die webhook is aangemaakt. Omdat de
-// woordfilter in ELK kanaal moet werken, gebruiken we hier NIET de globale webhookClient,
-// maar zoeken/maken we per kanaal een eigen webhook op (en cachen die), zodat het bericht
-// echt terugkomt in het kanaal waar het origineel geplaatst was.
-const perChannelWebhookCache = new Map(); // channelId (van het "hoofd"-tekstkanaal) -> Webhook
-
-function canManageWebhooks(channel) {
-  const me = channel.guild?.members?.me;
-  if (!me) return true;
-  return channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageWebhooks) ?? false;
-}
-
-async function getOrCreateWebhookForChannel(channel) {
-  // Bij threads hoort de webhook bij het bovenliggende tekstkanaal, niet bij de thread zelf.
-  const baseChannel = channel.isThread() ? channel.parent : channel;
-  if (!baseChannel) return null;
-
-  if (perChannelWebhookCache.has(baseChannel.id)) {
-    return perChannelWebhookCache.get(baseChannel.id);
-  }
-
-  if (!canManageWebhooks(baseChannel)) {
-    console.warn(
-      `⚠️ Geen 'Webhooks beheren'-rechten in <#${baseChannel.id}> — kan daar geen bericht "bewerken" via de woordfilter.`
-    );
-    return null;
-  }
-
-  try {
-    const existingHooks = await baseChannel.fetchWebhooks();
-    let hook = existingHooks.find((wh) => wh.owner?.id === client.user.id);
-    if (!hook) {
-      hook = await baseChannel.createWebhook({
-        name: "FantasieVeer",
-        avatar: FANTASIEVEER_AVATAR_URL || undefined,
-        reason: "Nodig voor de woordfilter (bericht 'bewerken' in dit kanaal).",
-      });
-      console.log(`🔗 Nieuwe webhook aangemaakt in <#${baseChannel.id}> voor de woordfilter.`);
-    }
-    perChannelWebhookCache.set(baseChannel.id, hook);
-    return hook;
-  } catch (err) {
-    console.warn(`⚠️ Kon geen webhook ophalen/aanmaken in <#${baseChannel.id}>:`, err.message);
-    return null;
-  }
-}
-
-async function sendAsImpersonatedAuthor(channel, message, content) {
-  const hook = await getOrCreateWebhookForChannel(channel);
-  if (!hook) return null; // aanroeper valt terug op een gewoon bot-bericht
-
-  const chunks = splitMessage(content);
-  let lastSent = null;
-  const displayName = message.member?.displayName || message.author.username;
-  const avatarURL = message.author.displayAvatarURL({ size: 256 });
-  for (let i = 0; i < chunks.length; i++) {
-    lastSent = await hook.send({
-      content: chunks[i],
-      username: displayName,
-      avatarURL,
-      threadId: channel.isThread() ? channel.id : undefined,
-      allowedMentions: { parse: [] }, // geen ongewenste her-pings vanuit een "bewerkt" bericht
-    });
   }
   return lastSent;
 }
@@ -2438,7 +2254,7 @@ client.once("clientReady", async () => {
   console.log(`🪶 FantasieVeer luistert met model: ${MODEL} (fallback: ${FALLBACK_MODEL})`);
   console.log(`🧠 Onthoudt de laatste ${MAX_EXCHANGES} uitwisselingen per kanaal`);
   console.log(`⏱️  Cooldown per gebruiker: ${COOLDOWN_MS}ms`);
-  console.log(`🚫 Woordfilter: ${BANNED_WORD_LIST.length} woord(en) ingesteld (met leetspeak/uitrek/uit-elkaar-detectie), AI herschrijft berichten netjes, noodgreepbericht: "${FILTER_REPLACEMENT_MESSAGE}"`);
+  console.log(`🚫 Woordfilter: ${BANNED_WORD_LIST.length} woord(en) ingesteld (met leetspeak/uitrek/uit-elkaar-detectie)`);
   console.log(`❓ FAQ-herkenning: ${FAQ_ENTRIES_LIST.length} item(s)`);
   console.log(`📈 Escalatie: ${ESCALATION_LIMIT} overtredingen binnen ${Math.round(ESCALATION_WINDOW / 60000)} min → mute van ${Math.round(MUTE_DURATION / 60000)} min`);
   console.log(`📋 Modkanaal: ${MOD_LOG_CHANNEL_ID_RESOLVED} | Statuskanaal: ${STATUS_CHANNEL_ID_RESOLVED} | Suggestiekanaal: ${SUGGESTION_CHANNEL_ID_RESOLVED}`);
@@ -2613,72 +2429,6 @@ client.on("messageCreate", async (message) => {
     }
     // !embed van een moderator mag er tijdens onderhoud gewoon doorheen — val door naar
     // de normale !embed-afhandeling verderop in deze functie.
-  }
-
-  // ----- Woordfilter: bericht laten herschrijven door de AI (werkt in ELK kanaal) -----
-  // Dit staat helemaal bovenaan, vóór de TARGET_CHANNEL_IDS-beperking en vóór alle
-  // commando's, zodat het overal werkt — ook in kanalen waar de AI-persona normaal
-  // niet reageert. Het originele bericht wordt verwijderd en direct teruggeplaatst,
-  // vermomd als dezelfde gebruiker, met een door de AI netjes herschreven versie
-  // zonder de grove taal.
-  if (isFeatureOn("woordfilter") && detectBannedWords(message.content)) {
-    console.log(`🚫 Verboden taal gedetecteerd bij ${message.author.username} in ${message.channelId}.`);
-    const { escalated, countInWindow } = flagCurseWord(message.author.id);
-
-    // Niet vertrouwen op een vooraf gecachte permissie-check (die kan stale zijn,
-    // bv. vlak na het aanpassen van bot-rollen zonder herstart) — gewoon direct
-    // proberen te verwijderen en de ECHTE foutmelding van Discord loggen als het niet lukt.
-    let deleted = false;
-    try {
-      await message.delete();
-      deleted = true;
-    } catch (err) {
-      console.warn(
-        `⚠️ Kon het originele bericht van ${message.author.username} niet verwijderen in <#${message.channelId}> (woordfilter). Discord-foutmelding: ${err.message}. Controleer of de bot in dít kanaal echt 'Berichten beheren' heeft (rol-rechten én eventuele kanaal-specifieke overschrijvingen).`
-      );
-    }
-
-    try {
-      if (deleted) {
-        const rewritten = isFeatureOn("ai")
-          ? await rewriteMessageWithAi(message.content)
-          : FILTER_REPLACEMENT_MESSAGE;
-        // Bericht "bewerkt" terugplaatsen, vermomd als de oorspronkelijke schrijver,
-        // via een webhook die specifiek bij DIT kanaal hoort (zie getOrCreateWebhookForChannel).
-        const impersonated = await sendAsImpersonatedAuthor(message.channel, message, rewritten);
-
-        if (!impersonated) {
-          // Geen webhook beschikbaar in dit kanaal (bv. rechten 'Webhooks beheren'
-          // ontbreken) — plaats het herschreven bericht dan als gewoon bot-bericht,
-          // zodat het in elk geval in het juiste kanaal blijft staan.
-          await message.channel.send(
-            `📝 **${message.author.username}** _(bericht automatisch aangepast)_: ${rewritten}`
-          );
-        }
-
-        await logToModChannel(
-          `🚫 **${message.author.username}** (<@${message.author.id}>) gebruikte verboden taal in <#${message.channelId}> — het bericht is automatisch herschreven. (${progressLabel(countInWindow)})\n**Origineel:** ${message.content.slice(0, 500)}\n**Herschreven:** ${rewritten.slice(0, 500)}`
-        );
-      } else {
-        // Geen rechten om te verwijderen ('Berichten beheren' ontbreekt): val terug
-        // op de oude, zichtbare waarschuwing zodat er in elk geval iets gebeurt.
-        const mentions = moderatorMentions() || "het team";
-        await sendAsVeer(
-          message.channel,
-          `<@${message.author.id}> ✨ Zulke taal gebruiken we hier niet! (${progressLabel(countInWindow)}) Ik roep ${mentions} er even bij. (Ik kon het bericht niet automatisch aanpassen — geef me de rechten 'Berichten beheren' om dat wel te kunnen.)`,
-          { mentionUsers: [...new Set([message.author.id, ...MODERATOR_IDS])] }
-        );
-        await logToModChannel(
-          `🚫 **${message.author.username}** (<@${message.author.id}>) gebruikte verboden taal in <#${message.channelId}> — kon niet worden aangepast (rechten ontbreken). (${progressLabel(countInWindow)})\n**Origineel:** ${message.content.slice(0, 500)}`
-        );
-      }
-
-      sendWarningDm(message.author, "je gebruikte taal die we hier niet tolereren", countInWindow).catch(() => {});
-      if (escalated) await announceEscalation(message.channel, message.author.id, message.author.username);
-    } catch (err) {
-      console.error("❌ Fout bij het versturen van het gefilterde bericht:", err.message);
-    }
-    return;
   }
 
   // ----- Commando's die in ELK kanaal werken, ook buiten TARGET_CHANNEL_IDS. -----
@@ -3277,6 +3027,28 @@ client.on("messageCreate", async (message) => {
       );
     } catch (err) {
       console.error("❌ Fout bij het aankondigen van de raadmijn-winnaar:", err.message);
+    }
+    return;
+  }
+
+  // ----- Woordfilter: extra laag naast de AI-detectie -----
+  if (isFeatureOn("woordfilter") && containsBannedWord(message.content)) {
+    console.log(`🚫 Verboden woord gedetecteerd van ${message.author.username} in ${message.channelId}.`);
+    const { escalated, countInWindow } = flagCurseWord(message.author.id);
+    const mentions = moderatorMentions() || "het team";
+    try {
+      await sendAsVeer(
+        message.channel,
+        `<@${message.author.id}> ✨ Zulke taal gebruiken we hier niet! (${progressLabel(countInWindow)}) Ik roep ${mentions} er even bij.`,
+        { mentionUsers: [...new Set([message.author.id, ...MODERATOR_IDS])] }
+      );
+      await logToModChannel(
+        `🚫 **${message.author.username}** (<@${message.author.id}>) gebruikte een verboden woord in <#${message.channelId}>. (${progressLabel(countInWindow)})`
+      );
+      sendWarningDm(message.author, "je gebruikte taal die we hier niet tolereren", countInWindow).catch(() => {});
+      if (escalated) await announceEscalation(message.channel, message.author.id, message.author.username);
+    } catch (err) {
+      console.error("❌ Fout bij het versturen van de woordfilter-waarschuwing:", err.message);
     }
     return;
   }
